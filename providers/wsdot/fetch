@@ -157,6 +157,17 @@ def time_label(seconds, zone):
     return label
 
 
+def when_label(seconds, now, zone):
+    """Clock time for today, a date for anything else. A wait-time note last
+    touched in 2020 must not read as "12:31 PM"."""
+    if seconds is None:
+        return ""
+    if day_key(seconds, zone) == day_key(now, zone):
+        return time_label(seconds, zone)
+    when = dt.datetime.fromtimestamp(seconds, tz=zone or dt.timezone.utc)
+    return when.strftime("%b %d, %Y") if when.year != dt.datetime.fromtimestamp(now, tz=zone or dt.timezone.utc).year else when.strftime("%b %d, %I:%M %p").replace(", 0", ", ")
+
+
 def day_key(seconds, zone):
     when = dt.datetime.fromtimestamp(seconds, tz=zone or dt.timezone.utc)
     return when.strftime("%Y-%m-%d")
@@ -352,7 +363,9 @@ def normalize_vessels(raw, a, b, route_abbrevs, zone):
         arr_id = integer(row.get("ArrivingTerminalID"))
         ops = row.get("OpRouteAbbrev") or []
         tagged = any(norm(x) in wanted for x in ops if isinstance(x, str)) if wanted else False
-        on_route = ({dep_id, arr_id} & {a, b}) and not (dep_id not in (a, b) and arr_id not in (a, b))
+        # Both ends must be ours: Seattle's dock serves Bremerton boats too,
+        # and one shared terminal is not the same route.
+        on_route = dep_id in (a, b) and arr_id in (a, b) and dep_id != arr_id
         if not (tagged or on_route):
             continue
         lat, lon = num(row.get("Latitude")), num(row.get("Longitude"))
@@ -377,7 +390,10 @@ def normalize_vessels(raw, a, b, route_abbrevs, zone):
             "leftDock": left, "leftDockLabel": time_label(left, zone),
             "scheduledDeparture": sched, "scheduledDepartureLabel": time_label(sched, zone),
             "delayMin": delay,
-            "notice": clean(row.get("VesselWatchMsg") or row.get("VesselWatchShutMsg"), MAX_TITLE),
+            # VesselWatchMsg is a site-wide status line ("VesselWatch is out of
+            # service") stamped on every vessel; only the per-vessel shutdown
+            # message, and only when its flag is set, says anything about this boat.
+            "notice": clean(row.get("VesselWatchShutMsg"), MAX_TITLE) if str(row.get("VesselWatchShutFlag", "0")).strip().lower() in ("1", "true") else "",
             "updated": epoch(row.get("TimeStamp")),
         })
         if len(out) >= MAX_VESSELS:
@@ -392,6 +408,8 @@ def schedule_times(raw, a, b):
     if not isinstance(raw, dict):
         return times, notes, annotations, pdf
     pdf = clean(raw.get("SchedulePDFUrl"), 300)
+    if pdf.startswith("http://") and ".wsdot.wa.gov/" in pdf:
+        pdf = "https://" + pdf[len("http://"):]
     if pdf and not pdf.startswith("https://"):
         pdf = ""
     for combo in raw.get("TerminalCombos") or []:
@@ -592,7 +610,7 @@ def build_departures(times, space, vessels, now, a, zone):
     return out
 
 
-def normalize_alerts(raw, route_ids, zone):
+def normalize_alerts(raw, route_ids, zone, now):
     out = []
     if not isinstance(raw, list):
         return out
@@ -615,7 +633,7 @@ def normalize_alerts(raw, route_ids, zone):
             "text": text,
             "type": clean(row.get("AlertType"), 40),
             "published": published,
-            "publishedLabel": time_label(published, zone),
+            "publishedLabel": when_label(published, now, zone),
             "allRoutes": all_routes,
         })
         if len(out) >= MAX_ALERTS:
@@ -623,7 +641,7 @@ def normalize_alerts(raw, route_ids, zone):
     return out
 
 
-def normalize_bulletins(raw, zone):
+def normalize_bulletins(raw, zone, now, skip_titles=()):
     out = []
     if isinstance(raw, list):
         raw = raw[0] if raw and isinstance(raw[0], dict) else {}
@@ -636,14 +654,17 @@ def normalize_bulletins(raw, zone):
         text = clean(b.get("BulletinText"), MAX_TEXT)
         if not title and not text:
             continue
+        # WSDOT mirrors route alerts into terminal bulletins; one copy is enough.
+        if norm(title) in skip_titles:
+            continue
         updated = epoch(b.get("BulletinLastUpdated"))
-        out.append({"title": title or text[:MAX_TITLE], "text": text, "updated": updated, "updatedLabel": time_label(updated, zone)})
+        out.append({"title": title or text[:MAX_TITLE], "text": text, "updated": updated, "updatedLabel": when_label(updated, now, zone)})
         if len(out) >= MAX_BULLETINS:
             break
     return out
 
 
-def normalize_waits(raw, zone):
+def normalize_waits(raw, zone, now):
     out = []
     if isinstance(raw, list):
         raw = raw[0] if raw and isinstance(raw[0], dict) else {}
@@ -661,7 +682,7 @@ def normalize_waits(raw, zone):
             "route": clean(w.get("RouteName"), MAX_NAME),
             "notes": notes,
             "updated": updated,
-            "updatedLabel": time_label(updated, zone),
+            "updatedLabel": when_label(updated, now, zone),
         })
         if len(out) >= MAX_WAITS:
             break
@@ -818,13 +839,13 @@ def build(args):
     doc["vessels"] = vessels
 
     alerts_raw, _ = api("alerts", "/schedule/rest/alerts", TTL["alerts"])
-    doc["alerts"] = normalize_alerts(alerts_raw, route_ids, zone)
+    doc["alerts"] = normalize_alerts(alerts_raw, route_ids, zone, now)
 
     bulletins_raw, _ = api("bulletins-%d" % a["id"], "/terminals/rest/terminalbulletins/%d" % a["id"], TTL["bulletins"])
-    doc["bulletins"] = normalize_bulletins(bulletins_raw, zone)
+    doc["bulletins"] = normalize_bulletins(bulletins_raw, zone, now, {norm(a["title"]) for a in doc["alerts"]})
 
     waits_raw, _ = api("waittimes-%d" % a["id"], "/terminals/rest/terminalwaittimes/%d" % a["id"], TTL["waittimes"])
-    waits = normalize_waits(waits_raw, zone)
+    waits = normalize_waits(waits_raw, zone, now)
     if route_ids:
         matching = [w for w in waits if w.get("routeId") in route_ids]
         waits = matching or waits

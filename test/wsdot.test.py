@@ -52,7 +52,7 @@ def vessel(vid, name, **kw):
 def schedule(times):
     return {
         "ScheduleID": 1, "ScheduleName": "Summer", "ScheduleSeason": 2,
-        "SchedulePDFUrl": "https://wsdot.com/ferries/schedule/summer.pdf",
+        "SchedulePDFUrl": "http://www.wsdot.wa.gov/ferries/pdf/2026Summer.pdf",
         "ScheduleStart": wcf(NOW - 86400 * 30), "ScheduleEnd": wcf(NOW + 86400 * 30), "AllRoutes": [5],
         "TerminalCombos": [{
             "DepartingTerminalID": BBI, "DepartingTerminalName": "Bainbridge Island",
@@ -107,6 +107,10 @@ def write_fixtures(directory, **overrides):
                    LeftDock=wcf(NOW - 12 * 60), ScheduledDeparture=wcf(NOW - 15 * 60), Eta=wcf(NOW + 34 * 60), EtaBasis="speed",
                    Heading=275),
             vessel(99, "Elsewhere", DepartingTerminalID=8, ArrivingTerminalID=12, OpRouteAbbrev=["ed-king"]),
+            # Shares Seattle's dock with us but sails to Bremerton: not our route.
+            vessel(77, "Kaleetan", DepartingTerminalID=SEA, ArrivingTerminalID=4, OpRouteAbbrev=["sea-br"],
+                   VesselWatchShutFlag="1", VesselWatchShutMsg="Vessel information unavailable",
+                   VesselWatchMsg="VesselWatch is out of service"),
         ],
         "sailingspace-3": space([
             (NOW - 10 * 60, 68, "Tacoma", 0, False),
@@ -124,9 +128,11 @@ def write_fixtures(directory, **overrides):
         "bulletins-3": [{"TerminalID": BBI, "Bulletins": [
             {"BulletinTitle": "Parking", "BulletinText": "Lot A closed\x00\x01", "BulletinSortSeq": 2, "BulletinLastUpdated": wcf(NOW - 3600)},
             {"BulletinTitle": "Walk-on", "BulletinText": "Use the overhead walkway", "BulletinSortSeq": 1, "BulletinLastUpdated": wcf(NOW - 7200)},
+            {"BulletinTitle": "Systemwide notice", "BulletinText": "mirrored from alerts", "BulletinSortSeq": 3, "BulletinLastUpdated": wcf(NOW - 60)},
         ]}],
         "waittimes-3": [{"TerminalID": BBI, "WaitTimes": [
             {"RouteID": 5, "RouteName": "Seattle / Bainbridge", "WaitTimeNotes": "One boat wait for vehicles", "WaitTimeLastUpdated": wcf(NOW - 300)},
+            {"RouteID": None, "RouteName": None, "WaitTimeNotes": "Ancient advice", "WaitTimeLastUpdated": wcf(NOW - 86400 * 400)},
         ]}],
         "cameras": {"FeedContentList": [
             {"TerminalID": BBI, "FerryCamera": {"CamID": 9040, "Lat": 47.62, "Lon": -122.51, "Title": "WSF Bainbridge Ferry Holding",
@@ -204,7 +210,7 @@ class Document(unittest.TestCase):
         self.assertEqual(self.doc["route"]["to"]["id"], SEA)
         self.assertEqual(self.doc["route"]["links"]["schedule"], "https://wsdot.com/ferries/schedule/scheduledetailbyroute.aspx?route=sea-bi")
         self.assertEqual(self.doc["route"]["links"]["map"], "https://wsdot.com/ferries/vesselwatch/default.aspx?view=seabi")
-        self.assertEqual(self.doc["route"]["links"]["schedulePdf"], "https://wsdot.com/ferries/schedule/summer.pdf")
+        self.assertEqual(self.doc["route"]["links"]["schedulePdf"], "https://www.wsdot.wa.gov/ferries/pdf/2026Summer.pdf")
 
     def test_departures_sorted_and_labelled(self):
         labels = [d["timeLabel"] for d in self.doc["departures"]]
@@ -247,6 +253,7 @@ class Document(unittest.TestCase):
     def test_vessels_filtered_to_route(self):
         names = sorted(v["name"] for v in self.doc["vessels"])
         self.assertEqual(names, ["Tacoma", "Wenatchee"])
+        self.assertEqual([v["notice"] for v in self.doc["vessels"]], ["", ""])
         wen = [v for v in self.doc["vessels"] if v["name"] == "Wenatchee"][0]
         self.assertEqual(wen["etaLabel"], "2:34 PM")
         self.assertEqual(wen["delayMin"], 3)   # left 3 min after scheduled
@@ -265,6 +272,16 @@ class Document(unittest.TestCase):
 
     def test_wait_times(self):
         self.assertEqual(self.doc["waitTimes"][0]["notes"], "One boat wait for vehicles")
+        self.assertEqual(self.doc["waitTimes"][0]["updatedLabel"], "1:55 PM")
+
+    def test_old_timestamps_show_a_date(self):
+        zone = wsdot.local_zone("America/Los_Angeles")
+        self.assertEqual(wsdot.when_label(NOW - 300, NOW, zone), "1:55 PM")
+        self.assertEqual(wsdot.when_label(NOW - 86400, NOW, zone), "Aug 27, 2:00 PM")
+        self.assertEqual(wsdot.when_label(NOW - 86400 * 400, NOW, zone), "Jul 24, 2025")
+
+    def test_bulletins_mirroring_alerts_are_dropped(self):
+        self.assertNotIn("Systemwide notice", [b["title"] for b in self.doc["bulletins"]])
 
     def test_cameras_only_https_and_this_terminal(self):
         cams = self.doc["cameras"]

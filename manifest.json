@@ -16,8 +16,12 @@
     "displayName": "Ferries",
     "description": "Countdown to the next sailing in the bar. The panel has the next departures with drive-up space and lateness, a live map of the boats on the route, terminal cameras, wait times, bulletins and route alerts, plus the full day's schedule.",
     "category": "Info",
-    "aliases": ["ferries", "ferry", "wsf"],
-    "allowMultiple": true,
+    "aliases": [
+      "ferries",
+      "ferry",
+      "wsf"
+    ],
+    "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
       "provider": "wsdot",
@@ -35,7 +39,9 @@
         "key": "provider",
         "type": "enum",
         "label": "Ferry system",
-        "options": ["wsdot"],
+        "options": [
+          "wsdot"
+        ],
         "defaultValue": "wsdot",
         "description": "Which provider under providers/ supplies the data. wsdot is Washington State Ferries."
       },
@@ -57,7 +63,11 @@
         "key": "barLabel",
         "type": "enum",
         "label": "Bar label",
-        "options": ["countdown", "time", "icon"],
+        "options": [
+          "countdown",
+          "time",
+          "icon"
+        ],
         "defaultValue": "countdown",
         "description": "What sits next to the icon: minutes until the next sailing, its clock time, or nothing."
       },

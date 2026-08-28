@@ -18,7 +18,7 @@
     { "id": 8,  "abbrev": "EDM", "name": "Edmonds",          "lat": 47.8130, "lon": -122.3844 },
     { "id": 9,  "abbrev": "FAU", "name": "Fauntleroy",       "lat": 47.5232, "lon": -122.3928 },
     { "id": 10, "abbrev": "FRH", "name": "Friday Harbor",    "lat": 48.5353, "lon": -123.0134 },
-    { "id": 11, "abbrev": "KEY", "name": "Coupeville",       "lat": 48.1590, "lon": -122.6726 },
+    { "id": 11, "abbrev": "COU", "name": "Coupeville",       "lat": 48.1590, "lon": -122.6726 },
     { "id": 12, "abbrev": "KIN", "name": "Kingston",         "lat": 47.7963, "lon": -122.4966 },
     { "id": 13, "abbrev": "LOP", "name": "Lopez Island",     "lat": 48.5709, "lon": -122.8830 },
     { "id": 14, "abbrev": "MUK", "name": "Mukilteo",         "lat": 47.9490, "lon": -122.3049 },

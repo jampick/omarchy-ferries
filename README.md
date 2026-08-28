@@ -10,6 +10,8 @@ without touching the panel (see [providers/README.md](providers/README.md)).
 
 ![the panel](docs/panel.png)
 
+![further down: boats, terminal, camera](docs/panel-lower.png)
+
 ## What it shows
 
 **In the bar:** a ferry icon and a countdown to the next sailing (`12m`,
@@ -174,6 +176,14 @@ node test/model.test.js        # panel logic, pure JavaScript
 python3 test/wsdot.test.py     # WSDOT provider against fixtures, offline
 bash test/run.test.sh          # output cap, dispatcher, camera allow-list
 ```
+
+## Not yet
+
+- One instance per bar. Route persistence goes through `omarchy bar set`,
+  which addresses the widget by id, so two instances would fight over one
+  setting. A per-instance key is the fix; until then, swap direction.
+- Reservations, fares and the Sidney B.C. run are shown only as far as the
+  operator's feeds carry them.
 
 ## Adding another ferry system
 
