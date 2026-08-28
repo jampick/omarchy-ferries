@@ -65,8 +65,10 @@ Later sailings on the same boat stay blank until their turn.
 
 - A free **WSDOT Traveler API access code**. Register an email at
   https://wsdot.wa.gov/traffic/api/ and it is emailed to you. Then either:
-  - `omarchy bar set jampick.ferries apiKey YOUR-CODE` (lands in
-    `~/.config/omarchy/shell.json`), or
+  - paste it into the panel: the first-run notice has a field and a Save
+    button, which run `omarchy bar set jampick.ferries apiKey YOUR-CODE` for
+    you (it lands in `~/.config/omarchy/shell.json`), or
+  - run that command yourself, or
   - save it to `~/.config/omarchy-ferries/wsdot-access-code` (mode 600 is a
     good idea), or
   - export `WSDOT_ACCESS_CODE`.

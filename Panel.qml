@@ -67,6 +67,18 @@ Panel {
   property int expandedAlert: -1
   property int expandedTerminal: -1
   property int expandedDeparture: -1
+  property string keyMessage: ""
+  property bool keyMessageUrgent: false
+
+  function saveKey() {
+    var text = keyField.text.trim()
+    if (text === "") { keyMessage = "Nothing to save yet."; keyMessageUrgent = true; return }
+    if (!ferries.persistApiKey(text)) { keyMessage = "That does not look like an access code (no spaces or quotes)."; keyMessageUrgent = true; return }
+    keyField.text = ""
+    keyMessage = "Saved. Fetching today's sailings…"
+    keyMessageUrgent = false
+    keyCatcher.forceActiveFocus()
+  }
 
   readonly property var departureRows: Model.departureRows(doc, now, ferries.departuresShown, fullDay)
   readonly property var vesselRows: Model.vesselRows(doc, now)
@@ -203,6 +215,20 @@ Panel {
     setIndexIn(section, index)
   }
 
+  // The panel is taller than its window on a busy day, and keyboard cursor
+  // movement does not scroll a Flickable by itself. Rows call this when they
+  // take the cursor; a row already on screen leaves the scroll alone, so
+  // mouse hover (which also moves the cursor) never yanks the view.
+  function ensureVisible(item) {
+    if (!item || !panelFlick) return
+    var top = item.mapToItem(column, 0, 0).y
+    var bottom = top + item.height
+    var margin = Style.space(8)
+    if (top < panelFlick.contentY + margin) panelFlick.contentY = Math.max(0, top - margin)
+    else if (bottom > panelFlick.contentY + panelFlick.height - margin)
+      panelFlick.contentY = Math.min(Math.max(0, panelFlick.contentHeight - panelFlick.height), bottom - panelFlick.height + margin)
+  }
+
   function runAction(action) {
     if (!action) return
     if (action.id === "fullday") fullDay = !fullDay
@@ -322,12 +348,12 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(440))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(680))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(760))
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: routeSearch.activeFocus
+      blocked: routeSearch.activeFocus || keyField.activeFocus
 
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) { root.cursorActive = true; return }
@@ -360,6 +386,7 @@ Panel {
             width: parent.width
             implicitHeight: hero.implicitHeight
             readonly property bool ringVisible: root.headerHasCursor
+            onRingVisibleChanged: if (ringVisible) root.ensureVisible(this)
             function focusHero() { root.focusRow("header", 0) }
 
             PanelHero {
@@ -399,12 +426,82 @@ Panel {
           }
 
           // --- Setup banners ----------------------------------------------------
-          NoticeRow {
+          // First-run setup. The code can be typed straight in here; it is
+          // saved through `omarchy bar set`, the same place the settings UI
+          // writes, so nothing about this widget's storage is special.
+          CursorSurface {
             visible: root.needsKey
-            urgentTone: false
-            body: "This provider needs a free WSDOT API access code. Register an email at wsdot.wa.gov/traffic/api, then either run  omarchy bar set jampick.ferries apiKey CODE  or save it to ~/.config/omarchy-ferries/wsdot-access-code."
-            buttonLabel: "Get an access code"
-            onActivated: ferries.openLink(root.doc && root.doc.links ? root.doc.links.apiRegistration : "")
+            width: parent.width
+            implicitHeight: keyColumn.implicitHeight + Style.spacing.rowPaddingX
+            foreground: root.foreground
+            bordered: true
+
+            Column {
+              id: keyColumn
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.leftMargin: Style.spacing.rowPaddingX
+              anchors.rightMargin: Style.spacing.rowPaddingX
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(8)
+
+              Text {
+                width: parent.width
+                text: "This provider needs a free WSDOT API access code. Register an email at wsdot.wa.gov/traffic/api (the code is emailed), then paste it here."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
+              }
+
+              Row {
+                width: parent.width
+                spacing: Style.space(6)
+
+                TextField {
+                  id: keyField
+                  width: parent.width - saveKeyButton.implicitWidth - parent.spacing
+                  placeholderText: "Paste the access code…"
+                  foreground: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  Keys.onReturnPressed: function(event) { root.saveKey(); event.accepted = true }
+                  Keys.onEscapePressed: function(event) { keyCatcher.forceActiveFocus(); event.accepted = true }
+                }
+
+                Button {
+                  id: saveKeyButton
+                  text: "Save"
+                  tooltipText: "Runs omarchy bar set jampick.ferries apiKey …"
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.bodySmall
+                  bordered: true
+                  anchors.verticalCenter: parent.verticalCenter
+                  onClicked: root.saveKey()
+                }
+              }
+
+              Text {
+                visible: root.keyMessage !== ""
+                width: parent.width
+                text: root.keyMessage
+                textFormat: Text.PlainText
+                color: root.keyMessageUrgent ? root.urgent : root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+
+              Button {
+                text: "Get an access code"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                bordered: true
+                onClicked: ferries.openLink(root.doc && root.doc.links ? root.doc.links.apiRegistration : "")
+              }
+            }
           }
 
           NoticeRow {
@@ -792,6 +889,7 @@ Panel {
               width: parent.width
               implicitHeight: cameraImage.status === Image.Ready ? Math.round(width * Math.min(0.75, Math.max(0.5, cameraImage.sourceSize.height / Math.max(1, cameraImage.sourceSize.width)))) : Style.space(80)
               hasCursor: root.cursorActive && root.focusSection === "camera"
+              onHasCursorChanged: if (hasCursor) root.ensureVisible(this)
               foreground: root.foreground
               fill: root.hoverFill
               currentFill: root.selectedFill
@@ -930,6 +1028,7 @@ Panel {
     bordered: true
     active: action ? (action.id === "fullday" && root.fullDay) || (action.id === "route" && root.pickerOpen) || (action.id === "camera" && root.cameraOn) : false
     hasCursor: root.cursorActive && root.focusSection === "actions" && root.actionIndex === slot
+    onHasCursorChanged: if (hasCursor) root.ensureVisible(this)
 
     onClicked: root.runAction(action)
     onHovered: function(isHovered) { if (isHovered) root.focusRow("actions", pill.slot) }
@@ -950,6 +1049,7 @@ Panel {
 
     hasCursor: root.cursorActive && isSelected
     current: row ? row.isNext : false
+    onHasCursorChanged: if (hasCursor) root.ensureVisible(this)
     foreground: root.foreground
     fill: root.hoverFill
     currentFill: root.selectedFill
@@ -1106,6 +1206,7 @@ Panel {
     fill: root.hoverFill
     currentFill: root.selectedFill
     implicitHeight: vesselBody.implicitHeight + Style.spacing.rowPaddingX
+    onHasCursorChanged: if (hasCursor) root.ensureVisible(this)
 
     MouseArea {
       anchors.fill: parent
@@ -1187,6 +1288,7 @@ Panel {
     fill: root.hoverFill
     currentFill: root.selectedFill
     implicitHeight: expBody.implicitHeight + Style.spacing.rowPaddingX
+    onHasCursorChanged: if (hasCursor) root.ensureVisible(this)
 
     MouseArea {
       anchors.fill: parent
@@ -1261,6 +1363,7 @@ Panel {
 
     hasCursor: root.cursorActive && isSelected
     current: row ? row.current : false
+    onHasCursorChanged: if (hasCursor) root.ensureVisible(this)
     foreground: root.foreground
     fill: root.hoverFill
     currentFill: root.selectedFill

@@ -314,10 +314,14 @@ function heroMeta(doc, now, loading) {
   }
   var dep = nextDeparture(doc, now)
   if (!dep) return "NO MORE SAILINGS TODAY"
-  var parts = ["NEXT " + dep.timeLabel]
+  // Past its time but still "next" means the boat is late at the dock; the
+  // pill says how late, so the line says when it was due instead of
+  // counting a negative number.
+  var overdue = Number(dep.time) <= Number(now) - 45
+  var parts = [(overdue ? "DUE " : "") + dep.timeLabel]
   if (dep.vessel) parts.push(dep.vessel.toUpperCase())
   var cd = countdown(now, dep.time)
-  if (cd) parts.push(cd === "now" ? "NOW" : "IN " + cd.toUpperCase())
+  if (!overdue && cd) parts.push(cd === "now" ? "NOW" : "IN " + cd.toUpperCase())
   var after = followingDeparture(doc, now)
   if (after) parts.push("THEN " + after.timeLabel)
   return parts.join(" · ")

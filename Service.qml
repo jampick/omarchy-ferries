@@ -29,6 +29,12 @@ Item {
   property string lastError: ""
   property real lastFetchAt: 0
   readonly property bool fetching: fetchProc.running
+  // Bumped whenever the question changes (route, provider, key). A result
+  // that comes back for an older question is discarded, and the refresh that
+  // was skipped because a fetch was already running is re-run on exit.
+  property int generation: 0
+  property int runningGeneration: -1
+  property bool refreshPending: false
 
   // Ticks so countdowns move between fetches.
   property real now: Date.now() / 1000
@@ -88,7 +94,9 @@ Item {
   // --- Refresh ---------------------------------------------------------------
 
   function refresh() {
-    if (fetchProc.running) return
+    if (fetchProc.running) { refreshPending = true; return }
+    refreshPending = false
+    runningGeneration = generation
     var argv = ["bash", fetchPath, "--provider", provider, "--route", route]
     if (apiKey !== "") argv.push("--key", apiKey)
     fetchProc.command = capped(argv)
@@ -98,9 +106,17 @@ Item {
 
   // A route change is a different document entirely. Drop the old one so the
   // hero says "loading" rather than showing yesterday's boat under a new name.
-  onRouteChanged: { doc = null; loading = true; cameraIndex = 0; cameraFile = ""; Qt.callLater(refresh) }
-  onProviderChanged: { doc = null; loading = true; Qt.callLater(refresh) }
-  onApiKeyChanged: Qt.callLater(refresh)
+  onRouteChanged: { generation++; doc = null; loading = true; cameraIndex = 0; cameraFile = ""; Qt.callLater(refresh) }
+  onProviderChanged: { generation++; doc = null; loading = true; Qt.callLater(refresh) }
+  onApiKeyChanged: { generation++; Qt.callLater(refresh) }
+
+  // Written through the same command a user would type, like the route.
+  function persistApiKey(value) {
+    var text = String(value || "").trim()
+    if (text.length > 200 || /[\s"'`$\\]/.test(text)) return false
+    Quickshell.execDetached(["omarchy", "bar", "set", "jampick.ferries", "apiKey", text])
+    return true
+  }
 
   function applyDocument(raw) {
     var parsed = Model.parseDoc(raw)
@@ -243,6 +259,10 @@ Item {
     stderr: StdioCollector { id: fetchErr; waitForEnd: true }
     onExited: function(exitCode) {
       fetchWatchdog.stop()
+      var stale = root.runningGeneration !== root.generation
+      root.runningGeneration = -1
+      if (stale || root.refreshPending) Qt.callLater(root.refresh)
+      if (stale) return
       var out = String(fetchOut.text || "")
       // The provider exits 1 for "ran, but the route has no data" and still
       // prints a document that says why. Only an empty stdout is a failure of
