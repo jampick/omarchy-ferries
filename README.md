@@ -41,7 +41,8 @@ is always red means nothing.
   highway approach. Refreshes every minute while visible. Nothing is
   downloaded while the panel is closed. WSDOT publishes stills, not video;
   the widget refreshes them, which is as close as the operator gets.
-- **Alerts.** Route alerts plus system-wide notices, newest first, expandable.
+- **Alerts.** This route's alerts plus system-wide notices, newest first,
+  expandable. See "Which alerts show" below for the scoping rule.
 - **Route picker.** Every terminal pair the operator sails today, filterable.
   Picking one writes the `route` setting so it survives a restart.
 
@@ -62,6 +63,33 @@ The status on each sailing is worked out from the vessel feed, not from a
 
 A boat holds one live status at a time, for the next sailing on its rotation.
 Later sailings on the same boat stay blank until their turn.
+
+**Projected times come from VesselWatch.** When a boat is under way, WSDOT's
+`Eta` for it is the projected arrival at the next dock, and that is what the
+row shows: a sailing that has left reads `Departed · arrives ~8:29 AM`; the
+next sailing on an inbound boat that cannot make its slot reads
+`Late 2 min · leaves ~8:47 AM, arrives ~9:22 AM` (ETA plus a 3 minute
+turnaround, plus the crossing). A boat still at the dock past its time has no
+ETA yet, so the row says how long the crossing takes once it leaves. WSDOT
+leaves `ArrivingTime` empty on most routes; the route's nominal crossing time
+(35 minutes for Seattle/Bainbridge) fills it in. Expand a row to see the
+timetable arrival next to the projection.
+
+## Which alerts show
+
+Only the route in focus, plus anything WSDOT flags for every route. WSF
+prefixes alert titles with the routes they are about (`Sea/BI/Brem -`,
+`Edm/King -`), and that prefix is more precise than the API's
+`AffectedRouteIDs`, which WSDOT also sets on regional notices: a highway fire
+near the Hood Canal Bridge was tagged onto Seattle/Bainbridge. So an alert is
+shown when:
+
+- WSDOT flags it for all routes, or
+- every route it affects is yours, or
+- its title prefix names both ends of your crossing.
+
+A multi-route notice with no prefix is regional and stays out. `Sea/Brem`
+items stay out of a Bainbridge view even though they share Colman Dock.
 
 ## Requirements
 

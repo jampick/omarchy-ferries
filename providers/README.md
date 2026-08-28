@@ -78,7 +78,12 @@ means for each list.
       "spaceKnown": true,                // false means the operator did not publish a count. NOT zero.
       "driveUp": 84, "maxSpace": 144,
       "showReservable": false, "reservable": null,
-      "annotations": ["Wait for second boat"]
+      "annotations": ["Wait for second boat"],
+      "crossingSec": 2100,               // nominal crossing, for projections
+      "estimated": true,                 // projections differ from the timetable
+      "estimateSource": "vesselwatch",   // "vesselwatch" | "clock" | ""
+      "estimatedDeparture": 1787952420, "estimatedDepartureLabel": "2:27 PM",
+      "estimatedArrival": 1787954520, "estimatedArrivalLabel": "3:02 PM"
     }
   ],
 

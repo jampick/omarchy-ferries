@@ -93,6 +93,7 @@ def write_fixtures(directory, **overrides):
             {"TerminalID": SEA, "TerminalName": "Seattle", "TerminalAbbrev": "P52", "Latitude": 47.6025, "Longitude": -122.3384},
         ],
         "routes-3-7": [{"RouteID": 5, "RouteAbbrev": "sea-bi", "Description": "Seattle / Bainbridge", "RegionID": 1, "ServiceDisruptions": []}],
+        "routedetails-5": {"RouteID": 5, "RouteAbbrev": "sea-bi", "CrossingTime": "35", "ReservationFlag": False},
         "schedule-3-7-2026-08-28": schedule([
             (NOW - 55 * 60, 38, "Wenatchee", []),      # 13:05, sailed
             (NOW - 10 * 60, 68, "Tacoma", []),         # 13:50, still at dock: LATE
@@ -124,6 +125,15 @@ def write_fixtures(directory, **overrides):
              "AllRoutesFlag": False, "AffectedRouteIDs": [6]},
             {"BulletinID": 3, "AlertFullTitle": "Systemwide notice", "BulletinText": "Applies to all", "PublishDate": wcf(NOW - 60),
              "AllRoutesFlag": True, "AffectedRouteIDs": []},
+            # Regional notice WSDOT tagged onto several routes, ours included, with no route prefix: not ours.
+            {"BulletinID": 4, "AlertFullTitle": "Fire on SR-104 at Milepost 11 Both Directions", "BulletinText": "Highway", "PublishDate": wcf(NOW - 2000),
+             "AllRoutesFlag": False, "AffectedRouteIDs": [5, 6, 8]},
+            # Bremerton terminal, tagged Sea/Brem: shares our Seattle dock, not our crossing.
+            {"BulletinID": 5, "AlertFullTitle": "Sea/Brem - ADA Alert: Bremerton Terminal elevator", "BulletinText": "Brem", "PublishDate": wcf(NOW - 3000),
+             "AllRoutesFlag": False, "AffectedRouteIDs": [3]},
+            # Colman Dock, tagged for both Seattle routes and prefixed with our terminals: ours.
+            {"BulletinID": 6, "AlertFullTitle": "Sea/BI/Brem - Potential Delays at Colman Dock", "BulletinText": "Dock", "PublishDate": wcf(NOW - 4000),
+             "AllRoutesFlag": False, "AffectedRouteIDs": [3, 5]},
         ],
         "bulletins-3": [{"TerminalID": BBI, "Bulletins": [
             {"BulletinTitle": "Parking", "BulletinText": "Lot A closed\x00\x01", "BulletinSortSeq": 2, "BulletinLastUpdated": wcf(NOW - 3600)},
@@ -261,7 +271,60 @@ class Document(unittest.TestCase):
 
     def test_alerts_filtered_to_route_plus_systemwide(self):
         titles = [a["title"] for a in self.doc["alerts"]]
-        self.assertEqual(titles, ["Systemwide notice", "Sea/BI: Tacoma running late"])
+        self.assertEqual(titles, ["Systemwide notice", "Sea/BI: Tacoma running late", "Sea/BI/Brem - Potential Delays at Colman Dock"])
+
+    def test_title_prefix_parsing(self):
+        self.assertEqual(wsdot.title_terminals("Sea/BI/Brem - Potential Delays"), {7, 3, 4})
+        self.assertEqual(wsdot.title_terminals("Sea/BI/Brem-ADA Alert- Elevator"), {7, 3, 4})
+        self.assertEqual(wsdot.title_terminals("Edm/King - Boarding pass"), {8, 12})
+        self.assertEqual(wsdot.title_terminals("PD/Tah - ADA Alert"), {16, 21})
+        self.assertEqual(wsdot.title_terminals("Fire on SR-104 at Milepost 11"), set())
+        self.assertEqual(wsdot.title_terminals(""), set())
+
+    def test_projected_times_from_vesselwatch(self):
+        d = self.deps()
+        late_at_dock = d["1:50 PM"]
+        self.assertTrue(late_at_dock["estimated"])
+        self.assertEqual(late_at_dock["estimatedDepartureLabel"], "2:00 PM")   # now
+        self.assertEqual(late_at_dock["estimatedArrivalLabel"], "2:35 PM")     # now + 35 min crossing
+        self.assertEqual(late_at_dock["crossingSec"], 35 * 60)
+        late_inbound = d["2:35 PM"]
+        self.assertTrue(late_inbound["estimated"])
+        self.assertEqual(late_inbound["estimateSource"], "vesselwatch")
+        self.assertEqual(late_inbound["estimatedDepartureLabel"], "2:37 PM")   # ETA 2:34 + 3 min
+        self.assertEqual(late_inbound["estimatedArrivalLabel"], "3:12 PM")
+        on_time = d["4:05 PM"]
+        self.assertFalse(on_time["estimated"])
+        self.assertEqual(on_time["estimatedArrivalLabel"], on_time["arrivalLabel"])
+
+    def test_null_arriving_time_uses_crossing_time(self):
+        tmp = tempfile.mkdtemp(prefix="ferries-crossing-")
+        sched = schedule([(NOW + 35 * 60, 38, "Wenatchee", [])])
+        sched["TerminalCombos"][0]["Times"][0]["ArrivingTime"] = None
+        write_fixtures(tmp, **{"schedule-3-7-2026-08-28": sched, "sailingspace-3": []})
+        rc, doc, _ = run(tmp)
+        self.assertEqual(doc["route"]["crossingMin"], 35)
+        self.assertEqual(doc["departures"][0]["arrivalLabel"], "3:10 PM")
+        self.assertEqual(doc["departures"][0]["crossingSec"], 35 * 60)
+        # No route details at all: arrival stays unknown rather than invented.
+        tmp2 = tempfile.mkdtemp(prefix="ferries-nocrossing-")
+        write_fixtures(tmp2, **{"schedule-3-7-2026-08-28": sched, "sailingspace-3": [], "routedetails-5": {}})
+        rc, doc2, _ = run(tmp2)
+        self.assertIsNone(doc2["route"]["crossingMin"])
+        self.assertEqual(doc2["departures"][0]["arrivalLabel"], "")
+
+    def test_departed_sailing_uses_vessel_eta(self):
+        tmp = tempfile.mkdtemp(prefix="ferries-departed-")
+        write_fixtures(tmp, vessellocations=[
+            vessel(38, "Wenatchee", LeftDock=wcf(NOW - 52 * 60), ScheduledDeparture=wcf(NOW - 55 * 60), Eta=wcf(NOW - 12 * 60)),
+        ])
+        rc, doc, _ = run(tmp)
+        first = doc["departures"][0]
+        self.assertEqual(first["status"], "departed")
+        self.assertEqual(first["delayMin"], 3)
+        self.assertTrue(first["estimated"])
+        self.assertEqual(first["estimatedDepartureLabel"], "1:08 PM")
+        self.assertEqual(first["estimatedArrivalLabel"], "1:48 PM")
         late = self.doc["alerts"][1]
         self.assertEqual(late["text"], "Mechanical & crew")
         self.assertEqual(late["type"], "Delay")

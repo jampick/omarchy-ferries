@@ -917,6 +917,7 @@ Panel {
               }
 
               MouseArea {
+                id: cameraMouse
                 anchors.fill: parent
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
@@ -930,7 +931,7 @@ Panel {
               }
 
               PanelToolTip {
-                visible: cameraSurface.hasCursor && ferries.cameraCount > 1
+                visible: cameraMouse.containsMouse && ferries.cameraCount > 1
                 text: "Click or n for the next camera · right click opens all of them"
                 fontFamily: root.fontFamily
               }
@@ -1115,8 +1116,9 @@ Panel {
             visible: text !== ""
             text: {
               if (!depItem.row) return ""
-              if (depItem.row.status !== "") return depItem.row.status
-              return depItem.row.past ? "" : depItem.row.countdown
+              var head = depItem.row.status !== "" ? depItem.row.status : (depItem.row.past ? "" : depItem.row.countdown)
+              if (depItem.row.projection) return head ? head + " · " + depItem.row.projection : depItem.row.projection
+              return head
             }
             textFormat: Text.PlainText
             color: depItem.row && depItem.row.status !== "" ? depItem.tone : root.dim
@@ -1180,7 +1182,7 @@ Panel {
         text: {
           if (!depItem.row) return ""
           var parts = []
-          if (depItem.row.arrivalLabel) parts.push("Arrives " + depItem.row.arrivalLabel)
+          if (depItem.row.arrivalLabel) parts.push((depItem.row.projection ? "Timetable arrival " : "Arrives ") + depItem.row.arrivalLabel)
           if (depItem.row.basis && depItem.row.status !== "") parts.push("Basis: " + depItem.row.basis)
           for (var i = 0; i < depItem.row.annotations.length; i++) parts.push(depItem.row.annotations[i])
           return parts.join(" · ")
@@ -1502,8 +1504,9 @@ Panel {
         var nameW = ctx.measureText(name).width
         var nx = v.x + 9
         if (nx + nameW > w - 4) nx = v.x - 9 - nameW
-        var ny = v.y - 9
-        if (ny < 8) ny = v.y + 10
+        var slot = Number(v.labelSlot) || 0
+        var ny = v.y - 9 - slot * 12
+        if (ny < 8) ny = v.y + 10 + slot * 12
         ctx.fillStyle = Util.alpha(colour, 0.9)
         ctx.fillText(name, nx, ny)
       }

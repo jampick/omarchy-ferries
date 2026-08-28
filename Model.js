@@ -202,6 +202,24 @@ function spaceInfo(dep) {
   return { label: label, ratio: ratio, severity: severity, known: true, reservable: dep.showReservable ? dep.reservable : null }
 }
 
+// "arrives ~9:22 AM" and friends, from the provider's VesselWatch-based
+// projection. The one case recomputed here is a boat still at the dock past
+// its time: its earliest arrival keeps sliding with the clock, so the label
+// is rebuilt from crossingSec rather than trusted from the last fetch.
+function projectionText(dep, now) {
+  if (!dep) return ""
+  var status = String(dep.status || "")
+  if (status === "late" && /still at dock/i.test(String(dep.basis || "")) && isFinite(Number(dep.crossingSec)) && Number(dep.crossingSec) > 0) {
+    var mins = Math.round(Number(dep.crossingSec) / 60)
+    return "arrives ~" + mins + " min after it leaves"
+  }
+  if (!dep.estimated) return ""
+  var parts = []
+  if (status === "late" && dep.estimatedDepartureLabel) parts.push("leaves ~" + dep.estimatedDepartureLabel)
+  if (dep.estimatedArrivalLabel) parts.push("arrives ~" + dep.estimatedArrivalLabel)
+  return parts.join(", ")
+}
+
 // Rows for the departures section. Normally the next `limit` sailings from
 // the next one onward (cancelled ones included, so a gap is visible as a
 // gap). Full-day mode is the whole schedule with past sailings dimmed.
@@ -219,6 +237,7 @@ function departureRows(doc, now, limit, fullDay) {
       time: dep.time,
       timeLabel: dep.timeLabel || "",
       arrivalLabel: dep.arrivalLabel || "",
+      projection: projectionText(dep, now),
       vessel: dep.vessel || "",
       countdown: countdown(now, dep.time),
       past: isPast(dep, now),
@@ -286,6 +305,8 @@ function tooltip(doc, now) {
   if (dep.vessel) parts.push(dep.vessel)
   var info = statusInfo(dep, now)
   parts.push(info.label || countdown(now, dep.time))
+  var projection = projectionText(dep, now)
+  if (projection) parts.push(projection)
   var space = spaceInfo(dep)
   if (space.known) parts.push(space.label === "Full" ? "no drive-up space" : space.label + " drive-up")
   return parts.join(" · ")
@@ -423,6 +444,15 @@ function mapLayout(route, vessels, w, h, pad) {
     pt.x = Math.max(padding / 2, Math.min(w - padding / 2, x))
     pt.y = Math.max(padding / 2, Math.min(h - padding / 2, y))
     pt.clamped = pt.x !== x || pt.y !== y
+    // Two boats passing mid-crossing land on the same pixel; their labels
+    // must not. Each vessel label takes the first free slot above or below.
+    pt.labelSlot = 0
+    if (pt.kind === "vessel") {
+      for (var q = 2; q < p; q++) {
+        var other = out[q]
+        if (Math.abs(other.x - pt.x) < 70 && Math.abs(other.y - pt.y) < 14) pt.labelSlot = other.labelSlot + 1
+      }
+    }
     out.push(pt)
   }
   return out
@@ -539,6 +569,7 @@ if (typeof module !== "undefined") {
     delayMinutes: delayMinutes,
     statusInfo: statusInfo,
     spaceInfo: spaceInfo,
+    projectionText: projectionText,
     departureRows: departureRows,
     ferryIcon: ferryIcon,
     barLabel: barLabel,

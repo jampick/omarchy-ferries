@@ -64,6 +64,7 @@ TTL = {
     "bulletins": 10 * 60,
     "waittimes": 5 * 60,
     "routes": 24 * 3600,
+    "routedetails": 24 * 3600,
     "terminalsandmates": 24 * 3600,
     "terminallocations": 24 * 3600,
     "cameras": 24 * 3600,
@@ -401,9 +402,10 @@ def normalize_vessels(raw, a, b, route_abbrevs, zone):
     return out
 
 
-def schedule_times(raw, a, b):
+def schedule_times(raw, a, b, crossing_sec=None):
     """Today's sailings A->B from the schedule endpoint, plus the combo's notes
-    and the PDF link for the season."""
+    and the PDF link for the season. WSDOT leaves ArrivingTime null on most
+    routes; the route's nominal crossing time fills it in."""
     times, notes, annotations, pdf = [], "", [], ""
     if not isinstance(raw, dict):
         return times, notes, annotations, pdf
@@ -426,9 +428,12 @@ def schedule_times(raw, a, b):
             if when is None:
                 continue
             idx = [i for i in (row.get("AnnotationIndexes") or []) if isinstance(i, int) and 0 <= i < len(annotations)]
+            arrival = epoch(row.get("ArrivingTime"))
+            if arrival is None and crossing_sec:
+                arrival = when + crossing_sec
             times.append({
                 "time": when,
-                "arrival": epoch(row.get("ArrivingTime")),
+                "arrival": arrival,
                 "vesselId": integer(row.get("VesselID")),
                 "vessel": clean(row.get("VesselName"), MAX_NAME),
                 "routes": [integer(r) for r in (row.get("Routes") or []) if integer(r) is not None],
@@ -607,20 +612,111 @@ def build_departures(times, space, vessels, now, a, zone):
         rec["status"], rec["delayMin"], rec["basis"] = status, delay, basis
         if key is not None and status in ("late", "at-dock", "inbound"):
             live_taken.add(key)
+        project(rec, boat, now, zone)
     return out
 
 
-def normalize_alerts(raw, route_ids, zone, now):
+def project(rec, boat, now, zone):
+    """Projected departure and arrival, from VesselWatch where it has an
+    opinion. WSDOT's Eta on a boat that is under way is its projected
+    arrival at the next dock, which is the number a late sailing needs.
+
+    Sets estimatedDeparture/estimatedArrival (epoch + label), crossingSec,
+    and `estimated` (true when they differ from the timetable)."""
+    when = rec["time"]
+    arrival = rec.get("arrival")
+    crossing = (arrival - when) if (arrival is not None and arrival > when) else None
+    rec["crossingSec"] = crossing
+    est_dep, est_arr, source = when, arrival, ""
+    status = rec.get("status")
+    if boat is not None:
+        here = rec["fromId"]
+        under_way_on_this = (not boat.get("atDock") and boat.get("fromId") == here
+                             and boat.get("scheduledDeparture") == when)
+        if status == "departed" and under_way_on_this:
+            est_dep = boat.get("leftDock") or when
+            est_arr = boat.get("eta") or (est_dep + crossing if crossing else arrival)
+            source = "vesselwatch"
+        elif status == "late" and boat.get("atDock"):
+            # Still here: the earliest it can leave is now.
+            est_dep = now
+            est_arr = now + crossing if crossing else None
+            source = "clock"
+        elif status == "late" and boat.get("eta") is not None:
+            est_dep = boat["eta"] + MIN_TURNAROUND_SEC
+            est_arr = est_dep + crossing if crossing else None
+            source = "vesselwatch"
+    rec["estimatedDeparture"] = est_dep
+    rec["estimatedDepartureLabel"] = time_label(est_dep, zone)
+    rec["estimatedArrival"] = est_arr
+    rec["estimatedArrivalLabel"] = time_label(est_arr, zone)
+    rec["estimated"] = source != "" and (est_dep != when or est_arr != arrival)
+    rec["estimateSource"] = source
+
+
+# WSF prefixes alert titles with the routes they are about: "Sea/BI/Brem -",
+# "Edm/King -", "PD/Tah -". The tags are more precise than AffectedRouteIDs,
+# which WSDOT also sets on regional notices (a highway fire near the Hood
+# Canal Bridge was tagged onto Seattle/Bainbridge). Terminal ids per tag.
+TITLE_TAGS = {
+    "sea": [7], "seattle": [7], "colman": [7],
+    "bi": [3], "bain": [3], "bainbridge": [3],
+    "brem": [4], "bremerton": [4],
+    "edm": [8], "edmonds": [8], "king": [12], "kingston": [12],
+    "muk": [14], "mukilteo": [14], "cl": [5], "clin": [5], "clinton": [5],
+    "pt": [17], "ptown": [17], "porttownsend": [17],
+    "key": [11], "keystone": [11], "coup": [11], "coupeville": [11],
+    "fau": [9], "faunt": [9], "fauntleroy": [9], "vas": [22], "vashon": [22],
+    "sou": [20], "south": [20], "southworth": [20],
+    "pd": [16], "ptd": [16], "ptdef": [16], "pointdefiance": [16],
+    "tah": [21], "tahlequah": [21],
+    "ana": [1], "anacortes": [1], "sj": [10, 13, 15, 18], "sanjuans": [10, 13, 15, 18],
+    "fh": [10], "fri": [10], "fridayharbor": [10], "orcas": [15], "lopez": [13], "shaw": [18],
+    "sid": [19], "sidney": [19],
+}
+
+
+def title_terminals(title):
+    """Terminal ids named by an alert title's route prefix, or an empty set
+    when the title carries no recognisable prefix."""
+    head = re.split(r"\s+[-\u2013\u2014:]\s*|-(?=[A-Za-z])", str(title or ""), maxsplit=1)[0]
+    head = head[:48]
+    ids = set()
+    for token in re.split(r"[/&,+ ]+", head):
+        key = norm(token)
+        if key in TITLE_TAGS:
+            ids.update(TITLE_TAGS[key])
+    return ids
+
+
+def alert_in_scope(row, route_ids, from_id, to_id):
+    """Route-only scoping plus system-wide notices.
+
+    Shown when WSDOT flags it for all routes, when every route it affects is
+    ours, or when its title prefix names both ends of our crossing. A notice
+    tagged onto several routes with no prefix is regional, not ours."""
+    if bool(row.get("AllRoutesFlag")):
+        return True
+    affected = {integer(x) for x in (row.get("AffectedRouteIDs") or [])}
+    affected.discard(None)
+    ours = set(route_ids)
+    if affected and ours and affected <= ours:
+        return True
+    named = title_terminals(row.get("AlertFullTitle"))
+    if named and from_id in named and to_id in named:
+        return True
+    return False
+
+
+def normalize_alerts(raw, route_ids, zone, now, from_id=None, to_id=None):
     out = []
     if not isinstance(raw, list):
         return out
-    wanted = set(route_ids)
     rows = [r for r in raw if isinstance(r, dict)]
     rows.sort(key=lambda r: epoch(r.get("PublishDate")) or 0, reverse=True)
     for row in rows:
-        affected = {integer(x) for x in (row.get("AffectedRouteIDs") or [])}
         all_routes = bool(row.get("AllRoutesFlag"))
-        if not all_routes and wanted and not (affected & wanted):
+        if not alert_in_scope(row, route_ids, from_id, to_id):
             continue
         title = clean(row.get("AlertFullTitle") or row.get("BulletinText"), MAX_TITLE)
         text = clean(row.get("BulletinText") or row.get("RouteAlertText") or row.get("CommunicationText"), MAX_TEXT)
@@ -821,9 +917,17 @@ def build(args):
             if not route_name:
                 route_name = clean(r.get("Description"), MAX_NAME)
 
+    crossing_min = None
+    if route_ids:
+        details_raw, _ = api("routedetails-%d" % route_ids[0], "/schedule/rest/routedetails/%s/%d" % (today, route_ids[0]), TTL["routedetails"])
+        if isinstance(details_raw, dict):
+            crossing_min = integer(details_raw.get("CrossingTime"))
+            if crossing_min is not None and not (1 <= crossing_min <= 600):
+                crossing_min = None
+
     sched_raw, _ = api("schedule-%d-%d-%s" % (a["id"], b["id"], today),
                        "/schedule/rest/scheduletoday/%d/%d/false" % (a["id"], b["id"]), TTL["schedule"])
-    times, notes, annotations, pdf = schedule_times(sched_raw, a["id"], b["id"])
+    times, notes, annotations, pdf = schedule_times(sched_raw, a["id"], b["id"], crossing_min * 60 if crossing_min else None)
     for t in times:
         for rid in t.get("routes") or []:
             if rid not in route_ids:
@@ -839,7 +943,7 @@ def build(args):
     doc["vessels"] = vessels
 
     alerts_raw, _ = api("alerts", "/schedule/rest/alerts", TTL["alerts"])
-    doc["alerts"] = normalize_alerts(alerts_raw, route_ids, zone, now)
+    doc["alerts"] = normalize_alerts(alerts_raw, route_ids, zone, now, a["id"], b["id"])
 
     bulletins_raw, _ = api("bulletins-%d" % a["id"], "/terminals/rest/terminalbulletins/%d" % a["id"], TTL["bulletins"])
     doc["bulletins"] = normalize_bulletins(bulletins_raw, zone, now, {norm(a["title"]) for a in doc["alerts"]})
@@ -871,6 +975,7 @@ def build(args):
         "ids": route_ids[:6],
         "abbrev": route_abbrevs[0] if route_abbrevs else "",
         "name": route_name or (a["name"] + " / " + b["name"]),
+        "crossingMin": crossing_min,
         "from": public_terminal(a),
         "to": public_terminal(b),
         "notes": notes,
