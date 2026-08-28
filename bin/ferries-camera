@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Download one camera still into a runtime cache file, bounded in size and
+# time. Prints the path on success.
+#
+#   ferries-camera URL DEST
+#
+# Stills are ordinary JPEGs of a few hundred KiB. The size cap is a defence
+# against a misbehaving server, not a budget: anything over it is discarded
+# whole rather than displayed half-decoded. Only https is accepted, and only
+# from the hosts the provider's camera feed names, so a hostile document
+# cannot turn this into a general-purpose downloader.
+
+set -uo pipefail
+
+url=${1:-}
+dest=${2:-}
+max=${FERRIES_CAMERA_MAX_BYTES:-3145728}
+
+[ -n "$url" ] && [ -n "$dest" ] || { echo "usage: ferries-camera URL DEST" >&2; exit 2; }
+
+case "$url" in
+  https://images.wsdot.wa.gov/*|https://www.seattle.gov/*|https://*.wsdot.wa.gov/*) ;;
+  *) echo "refusing camera host: $url" >&2; exit 3 ;;
+esac
+
+mkdir -p "$(dirname "$dest")" || exit 1
+tmp="$dest.part.$$"
+
+if curl -fsSL --max-time 12 --max-filesize "$max" --proto '=https' \
+     -H 'Cache-Control: no-cache' -o "$tmp" "$url"; then
+  # Reject anything that is not an image before the shell tries to decode it.
+  if head -c 4 "$tmp" | grep -q $'\xff\xd8\xff' || head -c 8 "$tmp" | grep -q 'PNG'; then
+    mv -f "$tmp" "$dest" && printf '%s\n' "$dest" && exit 0
+  fi
+  echo "not an image: $url" >&2
+fi
+rm -f "$tmp"
+exit 1

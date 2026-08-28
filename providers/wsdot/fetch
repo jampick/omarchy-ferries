@@ -1,0 +1,898 @@
+#!/usr/bin/env python3
+"""Washington State Ferries provider for the Omarchy Ferries widget.
+
+Talks to the WSDOT Ferries REST API and the public VesselWatch camera feed,
+and prints ONE normalized JSON document on stdout. The shape is documented in
+providers/README.md; the QML side renders that shape and nothing else, so a
+provider for another ferry system only has to produce the same document.
+
+    fetch --route "Bainbridge Island - Seattle" [--key CODE] [--now EPOCH]
+          [--cache-dir DIR] [--fixtures DIR] [--no-network]
+
+Everything here is bounded on purpose. Responses are read up to a byte cap
+and rejected past it, every array in the output has a length cap, every
+string has a length cap and control characters stripped. The document ends
+up inside a long-running shell process that owns the whole bar; a hostile or
+merely broken upstream response must not be able to grow it.
+
+Standard library only. No third-party packages.
+"""
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover
+    ZoneInfo = None
+
+SCHEMA = 1
+API = "https://www.wsdot.wa.gov/ferries/api"
+CAMERA_FEED = "https://wsdot.com/ferries/vesselwatch/Cameras.ashx"
+USER_AGENT = "omarchy-ferries/1.0 (+https://github.com/jampick/omarchy-ferries)"
+
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024   # a full vessellocations is ~40 KiB
+HTTP_TIMEOUT = 10
+
+MAX_DEPARTURES = 64
+MAX_VESSELS = 16
+MAX_ALERTS = 20
+MAX_BULLETINS = 10
+MAX_WAITS = 6
+MAX_CAMERAS = 8
+MAX_ROUTES = 80
+MAX_TEXT = 600
+MAX_TITLE = 160
+MAX_NAME = 64
+
+# Cache time-to-live per endpoint, seconds. Positions and sailing space are
+# live; the rest changes slowly and WSDOT asks callers not to hammer them.
+TTL = {
+    "vessellocations": 0,
+    "sailingspace": 0,
+    "schedule": 15 * 60,
+    "alerts": 5 * 60,
+    "bulletins": 10 * 60,
+    "waittimes": 5 * 60,
+    "routes": 24 * 3600,
+    "terminalsandmates": 24 * 3600,
+    "terminallocations": 24 * 3600,
+    "cameras": 24 * 3600,
+}
+
+# Same-day WSF turnaround at a dock is normally a few minutes; if the inbound
+# boat's ETA is later than this many seconds before the departure, that
+# departure cannot leave on time. Kept small on purpose: it is a floor.
+MIN_TURNAROUND_SEC = 3 * 60
+# A boat that is still at the dock this long after its scheduled time is late.
+LATE_GRACE_SEC = 60
+# How far into the past a sailing is still listed so a late boat does not
+# vanish from "next" the moment the clock passes its scheduled time.
+PAST_WINDOW_SEC = 45 * 60
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_WS = re.compile(r"[ \t\r\f\v]+")
+
+
+def clean(value, limit=MAX_TEXT):
+    """Trim, strip control characters, collapse whitespace, cap length."""
+    if value is None:
+        return ""
+    text = str(value)
+    text = _CONTROL.sub("", text)
+    text = re.sub(r"<[^>]{0,200}>", " ", text)  # bulletins carry HTML
+    text = text.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'")
+    text = _WS.sub(" ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text).strip()
+    if len(text) > limit:
+        text = text[: limit - 1].rstrip() + "…"
+    return text
+
+
+def num(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        out = float(value)
+        if out != out or out in (float("inf"), float("-inf")):
+            return default
+        return out
+    except (TypeError, ValueError):
+        return default
+
+
+def integer(value, default=None):
+    out = num(value, None)
+    if out is None:
+        return default
+    return int(out)
+
+
+_DOTNET_DATE = re.compile(r"Date\((-?\d+)(?:[+-]\d{4})?\)")
+
+
+def epoch(value):
+    """WSDOT emits WCF dates: "/Date(1693260300000-0700)/". The number is UTC
+    milliseconds; the suffix is decorative. Returns integer seconds or None."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    match = _DOTNET_DATE.search(str(value))
+    if not match:
+        return None
+    return int(match.group(1)) // 1000
+
+
+def local_zone(name):
+    if ZoneInfo is None:
+        return None
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return None
+
+
+def time_label(seconds, zone):
+    if seconds is None:
+        return ""
+    when = dt.datetime.fromtimestamp(seconds, tz=zone or dt.timezone.utc)
+    label = when.strftime("%I:%M %p").lstrip("0")
+    return label
+
+
+def day_key(seconds, zone):
+    when = dt.datetime.fromtimestamp(seconds, tz=zone or dt.timezone.utc)
+    return when.strftime("%Y-%m-%d")
+
+
+def norm(text):
+    return re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
+
+
+# ---------------------------------------------------------------------------
+# HTTP with caching
+# ---------------------------------------------------------------------------
+
+class Source:
+    """Fetches JSON with a byte cap, a timeout, and a disk cache that also
+    serves stale data when the network is down. `fixtures` replaces the
+    network entirely for tests."""
+
+    def __init__(self, cache_dir, fixtures=None, offline=False, now=None):
+        self.cache_dir = cache_dir
+        self.fixtures = fixtures
+        self.offline = offline
+        self.now = now or int(time.time())
+        self.errors = []
+        self.calls = 0
+
+    def _cache_path(self, name):
+        return os.path.join(self.cache_dir, name + ".json")
+
+    def _read_cache(self, name):
+        try:
+            with open(self._cache_path(name), "r", encoding="utf-8") as fh:
+                blob = json.load(fh)
+            if not isinstance(blob, dict) or "body" not in blob:
+                return None
+            return blob
+        except (OSError, ValueError):
+            return None
+
+    def _write_cache(self, name, body):
+        try:
+            os.makedirs(self.cache_dir, mode=0o700, exist_ok=True)
+            tmp = self._cache_path(name) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"fetchedAt": self.now, "body": body}, fh)
+            os.replace(tmp, self._cache_path(name))
+        except OSError:
+            pass
+
+    def _http(self, url):
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            raw = resp.read(MAX_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise ValueError("response over %d bytes" % MAX_RESPONSE_BYTES)
+        return json.loads(raw.decode("utf-8", "replace"))
+
+    def get(self, name, url, ttl):
+        """Return (body, fromCache). Cached copies inside their TTL are served
+        without touching the network; on any failure the stale copy is used."""
+        if self.fixtures is not None:
+            path = os.path.join(self.fixtures, name + ".json")
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    return json.load(fh), False
+            except (OSError, ValueError) as exc:
+                self.errors.append("%s: fixture missing (%s)" % (name, exc.__class__.__name__))
+                return None, False
+
+        cached = self._read_cache(name)
+        if cached is not None and ttl > 0 and self.now - int(cached.get("fetchedAt") or 0) < ttl:
+            return cached["body"], True
+
+        if self.offline:
+            return (cached["body"] if cached else None), True
+
+        try:
+            self.calls += 1
+            body = self._http(url)
+            self._write_cache(name, body)
+            return body, False
+        except urllib.error.HTTPError as exc:
+            self.errors.append("%s: HTTP %s" % (name, exc.code))
+            if exc.code in (401, 403):
+                self.errors.append("api key rejected")
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            self.errors.append("%s: %s" % (name, exc.__class__.__name__))
+        return (cached["body"] if cached else None), True
+
+
+# ---------------------------------------------------------------------------
+# Static provider metadata
+# ---------------------------------------------------------------------------
+
+def load_provider_meta():
+    with open(os.path.join(HERE, "provider.json"), "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def find_key(explicit):
+    """Setting, then environment, then a file the user owns. The file exists
+    for people who would rather not have the code sit in shell.json."""
+    if explicit and explicit.strip():
+        return explicit.strip()
+    env = os.environ.get("WSDOT_ACCESS_CODE", "").strip()
+    if env:
+        return env
+    home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    path = os.path.join(home, "omarchy-ferries", "wsdot-access-code")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def resolve_terminal(token, terminals):
+    """Accept an id, an abbreviation, an exact name, or a unique name prefix."""
+    needle = norm(token)
+    if not needle:
+        return None
+    for term in terminals:
+        if needle == str(term["id"]) or needle == norm(term["abbrev"]) or needle == norm(term["name"]):
+            return term
+    prefix = [t for t in terminals if norm(t["name"]).startswith(needle)]
+    if len(prefix) == 1:
+        return prefix[0]
+    return None
+
+
+def split_route(text):
+    parts = re.split(r"\s*(?:->|→|>|\bto\b|-|/)\s*", str(text or ""), maxsplit=1)
+    if len(parts) != 2:
+        return None, None
+    return parts[0].strip(), parts[1].strip()
+
+
+def merge_terminal_locations(static, live):
+    """Live coordinates and names win when present; the static table is the
+    fallback for a cold start with no network."""
+    if not isinstance(live, list):
+        return static
+    by_id = {t["id"]: dict(t) for t in static}
+    for row in live:
+        if not isinstance(row, dict):
+            continue
+        tid = integer(row.get("TerminalID"))
+        if tid is None:
+            continue
+        entry = by_id.get(tid, {"id": tid, "abbrev": "", "name": ""})
+        entry["name"] = clean(row.get("TerminalName"), MAX_NAME) or entry.get("name", "")
+        entry["abbrev"] = clean(row.get("TerminalAbbrev"), 8) or entry.get("abbrev", "")
+        lat, lon = num(row.get("Latitude")), num(row.get("Longitude"))
+        if lat is not None and lon is not None and -90 <= lat <= 90 and -180 <= lon <= 180:
+            entry["lat"], entry["lon"] = lat, lon
+        by_id[tid] = entry
+    return sorted(by_id.values(), key=lambda t: t.get("name", ""))
+
+
+def route_pages(meta, a, b):
+    for page in meta.get("routePages", []):
+        pair = set(page.get("terminals", []))
+        if pair == {a, b}:
+            return page
+    return None
+
+
+def public_terminal(term):
+    return {
+        "id": term["id"],
+        "name": term.get("name", ""),
+        "abbrev": term.get("abbrev", ""),
+        "lat": term.get("lat"),
+        "lon": term.get("lon"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Normalization
+# ---------------------------------------------------------------------------
+
+def normalize_vessels(raw, a, b, route_abbrevs, zone):
+    """Vessels that belong to this route: either endpoint is one of ours, or
+    WSDOT tags the vessel with the route abbreviation."""
+    out = []
+    if not isinstance(raw, list):
+        return out
+    wanted = {norm(x) for x in route_abbrevs}
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        dep_id = integer(row.get("DepartingTerminalID"))
+        arr_id = integer(row.get("ArrivingTerminalID"))
+        ops = row.get("OpRouteAbbrev") or []
+        tagged = any(norm(x) in wanted for x in ops if isinstance(x, str)) if wanted else False
+        on_route = ({dep_id, arr_id} & {a, b}) and not (dep_id not in (a, b) and arr_id not in (a, b))
+        if not (tagged or on_route):
+            continue
+        lat, lon = num(row.get("Latitude")), num(row.get("Longitude"))
+        left = epoch(row.get("LeftDock"))
+        sched = epoch(row.get("ScheduledDeparture"))
+        eta = epoch(row.get("Eta"))
+        delay = None
+        if left is not None and sched is not None:
+            delay = int(round((left - sched) / 60.0))
+        out.append({
+            "id": integer(row.get("VesselID")),
+            "name": clean(row.get("VesselName"), MAX_NAME),
+            "lat": lat, "lon": lon,
+            "speed": num(row.get("Speed")),
+            "heading": integer(row.get("Heading")),
+            "atDock": bool(row.get("AtDock")),
+            "inService": bool(row.get("InService", True)),
+            "fromId": dep_id, "from": clean(row.get("DepartingTerminalName"), MAX_NAME),
+            "toId": arr_id, "to": clean(row.get("ArrivingTerminalName"), MAX_NAME),
+            "eta": eta, "etaLabel": time_label(eta, zone),
+            "etaBasis": clean(row.get("EtaBasis"), MAX_TITLE),
+            "leftDock": left, "leftDockLabel": time_label(left, zone),
+            "scheduledDeparture": sched, "scheduledDepartureLabel": time_label(sched, zone),
+            "delayMin": delay,
+            "notice": clean(row.get("VesselWatchMsg") or row.get("VesselWatchShutMsg"), MAX_TITLE),
+            "updated": epoch(row.get("TimeStamp")),
+        })
+        if len(out) >= MAX_VESSELS:
+            break
+    return out
+
+
+def schedule_times(raw, a, b):
+    """Today's sailings A->B from the schedule endpoint, plus the combo's notes
+    and the PDF link for the season."""
+    times, notes, annotations, pdf = [], "", [], ""
+    if not isinstance(raw, dict):
+        return times, notes, annotations, pdf
+    pdf = clean(raw.get("SchedulePDFUrl"), 300)
+    if pdf and not pdf.startswith("https://"):
+        pdf = ""
+    for combo in raw.get("TerminalCombos") or []:
+        if not isinstance(combo, dict):
+            continue
+        if integer(combo.get("DepartingTerminalID")) != a or integer(combo.get("ArrivingTerminalID")) != b:
+            continue
+        notes = clean(combo.get("SailingNotes"), MAX_TEXT)
+        annotations = [clean(x, MAX_TITLE) for x in (combo.get("Annotations") or []) if isinstance(x, str)][:12]
+        for row in combo.get("Times") or []:
+            if not isinstance(row, dict):
+                continue
+            when = epoch(row.get("DepartingTime"))
+            if when is None:
+                continue
+            idx = [i for i in (row.get("AnnotationIndexes") or []) if isinstance(i, int) and 0 <= i < len(annotations)]
+            times.append({
+                "time": when,
+                "arrival": epoch(row.get("ArrivingTime")),
+                "vesselId": integer(row.get("VesselID")),
+                "vessel": clean(row.get("VesselName"), MAX_NAME),
+                "routes": [integer(r) for r in (row.get("Routes") or []) if integer(r) is not None],
+                "annotations": [annotations[i] for i in idx][:4],
+            })
+    times.sort(key=lambda t: t["time"])
+    return times, notes, annotations, pdf
+
+
+def sailing_space(raw, b):
+    """Departure time -> space record for sailings whose arrival list includes
+    terminal B. WSDOT publishes this only for select departures, so a miss is
+    normal and means 'unknown', not 'zero'."""
+    out = {}
+    if isinstance(raw, list):
+        raw = raw[0] if raw and isinstance(raw[0], dict) else {}
+    if not isinstance(raw, dict):
+        return out
+    for dep in raw.get("DepartingSpaces") or []:
+        if not isinstance(dep, dict):
+            continue
+        when = epoch(dep.get("Departure"))
+        if when is None:
+            continue
+        record = {
+            "cancelled": bool(dep.get("IsCancelled")),
+            "vessel": clean(dep.get("VesselName"), MAX_NAME),
+            "vesselId": integer(dep.get("VesselID")),
+            "maxSpace": integer(dep.get("MaxSpaceCount")),
+            "driveUp": None, "reservable": None, "showReservable": False, "spaceKnown": False,
+        }
+        for arr in dep.get("SpaceForArrivalTerminals") or []:
+            if not isinstance(arr, dict):
+                continue
+            ids = {integer(x) for x in (arr.get("ArrivalTerminalIDs") or [])}
+            ids.add(integer(arr.get("TerminalID")))
+            if b not in ids:
+                continue
+            if arr.get("DisplayDriveUpSpace", True):
+                record["driveUp"] = integer(arr.get("DriveUpSpaceCount"))
+            record["showReservable"] = bool(arr.get("DisplayReservableSpace"))
+            if record["showReservable"]:
+                record["reservable"] = integer(arr.get("ReservableSpaceCount"))
+            record["maxSpace"] = integer(arr.get("MaxSpaceCount"), record["maxSpace"])
+            record["spaceKnown"] = record["driveUp"] is not None
+            break
+        out[when] = record
+    return out
+
+
+def find_boat(dep, vessels):
+    for v in vessels:
+        if dep.get("vesselId") is not None and v.get("id") == dep.get("vesselId"):
+            return v
+        if dep.get("vessel") and norm(v.get("name")) == norm(dep.get("vessel")):
+            return v
+    return None
+
+
+def classify(dep, boat, now, live_taken):
+    """Decide what a sailing is doing right now from the vessel feed.
+
+    `boat` is the vessel assigned to it (or None); `live_taken` says whether
+    an earlier sailing on the same boat already claimed its live state. A
+    boat sitting at the dock is at the dock for ONE sailing, the next one on
+    its rotation, so later sailings on the same boat stay "scheduled".
+
+    Returns (status, delayMin, basis). Statuses:
+      cancelled  WSDOT says so
+      departed   the boat has left our dock for this sailing (or the sailing
+                 is in the past and the boat is not here for it)
+      late       past scheduled time and the boat is still at the dock, or
+                 the inbound boat's ETA makes an on-time departure impossible
+      at-dock    the boat is tied up at our terminal ahead of this sailing
+      inbound    the boat is on its way to our terminal for this sailing
+      scheduled  nothing live to say yet
+    delayMin is an estimate and basis says where it came from, because a
+    figure without provenance invites more trust than it has earned."""
+    if dep.get("cancelled"):
+        return "cancelled", None, "operator"
+    when = dep["time"]
+    past = now > when + LATE_GRACE_SEC
+    if boat is None:
+        return ("departed" if past else "scheduled"), None, ""
+
+    here = dep["fromId"]
+    sched = boat.get("scheduledDeparture")
+    left = boat.get("leftDock")
+    at_our_dock = bool(boat.get("atDock")) and boat.get("fromId") == here
+    inbound_to_us = not boat.get("atDock") and boat.get("toId") == here
+
+    # The boat has sailed on this very sailing.
+    if not boat.get("atDock") and boat.get("fromId") == here and sched == when and left is not None:
+        return "departed", int(round((left - when) / 60.0)), "left dock"
+
+    if past:
+        # Still here past its time, and this is the sailing it is here for.
+        if at_our_dock and not live_taken and (sched is None or sched <= when + LATE_GRACE_SEC):
+            return "late", int(round((now - when) / 60.0)), "still at dock"
+        return "departed", None, ""
+
+    if live_taken:
+        return "scheduled", None, ""
+
+    if at_our_dock:
+        return "at-dock", 0, "at dock"
+
+    # The boat is coming to us. If it cannot arrive and turn around in time,
+    # say so now rather than at the scheduled minute.
+    if inbound_to_us:
+        eta = boat.get("eta")
+        if eta is not None and when < now + 3 * 3600:
+            slack = when - (eta + MIN_TURNAROUND_SEC)
+            if slack < 0:
+                return "late", int(round(-slack / 60.0)), "inbound ETA " + (boat.get("etaLabel") or "")
+        return "inbound", 0, "inbound"
+
+    return "scheduled", None, ""
+
+
+def build_departures(times, space, vessels, now, a, zone):
+    out = []
+    for row in times:
+        when = row["time"]
+        if when < now - PAST_WINDOW_SEC and not (row.get("annotations")):
+            pass  # still listed: the full-day view wants the whole day
+        rec = {
+            "time": when,
+            "timeLabel": time_label(when, zone),
+            "arrival": row.get("arrival"),
+            "arrivalLabel": time_label(row.get("arrival"), zone),
+            "vessel": row.get("vessel") or "",
+            "vesselId": row.get("vesselId"),
+            "fromId": a,
+            "routes": row.get("routes") or [],
+            "annotations": row.get("annotations") or [],
+            "cancelled": False,
+            "driveUp": None, "reservable": None, "showReservable": False, "maxSpace": None, "spaceKnown": False,
+        }
+        sp = space.get(when)
+        if sp:
+            rec.update({k: sp[k] for k in ("cancelled", "driveUp", "reservable", "showReservable", "maxSpace", "spaceKnown")})
+            if sp.get("vessel") and not rec["vessel"]:
+                rec["vessel"] = sp["vessel"]
+                rec["vesselId"] = sp.get("vesselId")
+            elif sp.get("vessel") and norm(sp["vessel"]) != norm(rec["vessel"]):
+                # Sailing space is the more current of the two feeds: WSF
+                # swaps boats during the day and the schedule lags.
+                rec["vessel"] = sp["vessel"]
+                rec["vesselId"] = sp.get("vesselId")
+        out.append(rec)
+    # Sailing-space rows that the schedule did not list (extra sailings).
+    listed = {r["time"] for r in out}
+    for when, sp in space.items():
+        if when in listed:
+            continue
+        rec = {
+            "time": when, "timeLabel": time_label(when, zone), "arrival": None, "arrivalLabel": "",
+            "vessel": sp.get("vessel") or "", "vesselId": sp.get("vesselId"), "fromId": a, "routes": [],
+            "annotations": ["Added sailing"], "cancelled": sp["cancelled"], "driveUp": sp["driveUp"],
+            "reservable": sp["reservable"], "showReservable": sp["showReservable"], "maxSpace": sp["maxSpace"],
+            "spaceKnown": sp["spaceKnown"],
+        }
+        out.append(rec)
+    out.sort(key=lambda r: r["time"])
+    out = out[:MAX_DEPARTURES]
+
+    # Live state is handed out in time order, once per boat: the first
+    # sailing a boat has not yet completed gets at-dock / inbound / late, and
+    # the rest of its rotation stays "scheduled" until its turn comes.
+    live_taken = set()
+    for rec in out:
+        boat = find_boat(rec, vessels)
+        key = boat.get("id") if boat else None
+        status, delay, basis = classify(rec, boat, now, key in live_taken)
+        rec["status"], rec["delayMin"], rec["basis"] = status, delay, basis
+        if key is not None and status in ("late", "at-dock", "inbound"):
+            live_taken.add(key)
+    return out
+
+
+def normalize_alerts(raw, route_ids, zone):
+    out = []
+    if not isinstance(raw, list):
+        return out
+    wanted = set(route_ids)
+    rows = [r for r in raw if isinstance(r, dict)]
+    rows.sort(key=lambda r: epoch(r.get("PublishDate")) or 0, reverse=True)
+    for row in rows:
+        affected = {integer(x) for x in (row.get("AffectedRouteIDs") or [])}
+        all_routes = bool(row.get("AllRoutesFlag"))
+        if not all_routes and wanted and not (affected & wanted):
+            continue
+        title = clean(row.get("AlertFullTitle") or row.get("BulletinText"), MAX_TITLE)
+        text = clean(row.get("BulletinText") or row.get("RouteAlertText") or row.get("CommunicationText"), MAX_TEXT)
+        if not title and not text:
+            continue
+        published = epoch(row.get("PublishDate"))
+        out.append({
+            "id": integer(row.get("BulletinID")),
+            "title": title or text[:MAX_TITLE],
+            "text": text,
+            "type": clean(row.get("AlertType"), 40),
+            "published": published,
+            "publishedLabel": time_label(published, zone),
+            "allRoutes": all_routes,
+        })
+        if len(out) >= MAX_ALERTS:
+            break
+    return out
+
+
+def normalize_bulletins(raw, zone):
+    out = []
+    if isinstance(raw, list):
+        raw = raw[0] if raw and isinstance(raw[0], dict) else {}
+    if not isinstance(raw, dict):
+        return out
+    rows = [b for b in (raw.get("Bulletins") or []) if isinstance(b, dict)]
+    rows.sort(key=lambda b: integer(b.get("BulletinSortSeq"), 0))
+    for b in rows:
+        title = clean(b.get("BulletinTitle"), MAX_TITLE)
+        text = clean(b.get("BulletinText"), MAX_TEXT)
+        if not title and not text:
+            continue
+        updated = epoch(b.get("BulletinLastUpdated"))
+        out.append({"title": title or text[:MAX_TITLE], "text": text, "updated": updated, "updatedLabel": time_label(updated, zone)})
+        if len(out) >= MAX_BULLETINS:
+            break
+    return out
+
+
+def normalize_waits(raw, zone):
+    out = []
+    if isinstance(raw, list):
+        raw = raw[0] if raw and isinstance(raw[0], dict) else {}
+    if not isinstance(raw, dict):
+        return out
+    for w in raw.get("WaitTimes") or []:
+        if not isinstance(w, dict):
+            continue
+        notes = clean(w.get("WaitTimeNotes"), MAX_TEXT)
+        if not notes:
+            continue
+        updated = epoch(w.get("WaitTimeLastUpdated"))
+        out.append({
+            "routeId": integer(w.get("RouteID")),
+            "route": clean(w.get("RouteName"), MAX_NAME),
+            "notes": notes,
+            "updated": updated,
+            "updatedLabel": time_label(updated, zone),
+        })
+        if len(out) >= MAX_WAITS:
+            break
+    return out
+
+
+def normalize_cameras(raw, terminal_id):
+    out = []
+    if not isinstance(raw, dict):
+        return out
+    for row in raw.get("FeedContentList") or []:
+        if not isinstance(row, dict) or integer(row.get("TerminalID")) != terminal_id:
+            continue
+        cam = row.get("FerryCamera") or {}
+        url = clean(cam.get("ImgURL"), 300)
+        if not url.startswith("https://") or not cam.get("IsActive", True):
+            continue
+        out.append({
+            "id": integer(cam.get("CamID")),
+            "title": clean(cam.get("Title"), MAX_TITLE),
+            "url": url,
+            "lat": num(cam.get("Lat")), "lon": num(cam.get("Lon")),
+            "terminalId": terminal_id,
+        })
+        if len(out) >= MAX_CAMERAS:
+            break
+    # Terminal-owned holding-lot cameras first; highway approach cameras after.
+    out.sort(key=lambda c: (0 if c["title"].upper().startswith("WSF") else 1))
+    return out
+
+
+def normalize_routes(raw, terminals):
+    """Every terminal pair WSDOT sails today, for the route picker."""
+    out = []
+    if not isinstance(raw, list):
+        return out
+    by_id = {t["id"]: t for t in terminals}
+    seen = set()
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        a, b = integer(row.get("DepartingTerminalID")), integer(row.get("ArrivingTerminalID"))
+        if a is None or b is None or (a, b) in seen:
+            continue
+        seen.add((a, b))
+        fa = by_id.get(a, {}).get("name") or clean(row.get("DepartingDescription"), MAX_NAME)
+        fb = by_id.get(b, {}).get("name") or clean(row.get("ArrivingDescription"), MAX_NAME)
+        out.append({"fromId": a, "from": fa, "toId": b, "to": fb, "label": fa + " → " + fb})
+        if len(out) >= MAX_ROUTES:
+            break
+    out.sort(key=lambda r: (r["from"], r["to"]))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def build(args):
+    meta = load_provider_meta()
+    zone = local_zone(meta.get("timezone", "America/Los_Angeles"))
+    now = args.now or int(time.time())
+    cache_dir = args.cache_dir or os.path.join(
+        os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"),
+        "omarchy-ferries", "wsdot")
+    src = Source(cache_dir, fixtures=args.fixtures, offline=args.no_network, now=now)
+
+    doc = {
+        "schema": SCHEMA,
+        "provider": meta["id"],
+        "providerName": meta["name"],
+        "generatedAt": now,
+        "timezone": meta.get("timezone", ""),
+        "ok": False,
+        "error": "",
+        "errors": [],
+        "route": None,
+        "departures": [],
+        "vessels": [],
+        "alerts": [],
+        "bulletins": [],
+        "waitTimes": [],
+        "cameras": [],
+        "routes": [],
+        "links": dict(meta.get("links", {})),
+    }
+
+    key = find_key(args.key)
+    if not key and args.fixtures is None:
+        doc["error"] = "no api key"
+        doc["links"]["apiRegistration"] = meta["links"]["apiRegistration"]
+        # The camera feed and terminal table need no key, so a fresh install
+        # still shows something real while the code is on its way.
+        terminals = meta["terminals"]
+        a_tok, b_tok = split_route(args.route)
+        a = resolve_terminal(a_tok, terminals)
+        b = resolve_terminal(b_tok, terminals)
+        if a and b:
+            doc["route"] = {"id": None, "abbrev": "", "name": a["name"] + " → " + b["name"],
+                            "from": public_terminal(a), "to": public_terminal(b), "links": {}}
+            cams, _ = src.get("cameras", CAMERA_FEED, TTL["cameras"])
+            doc["cameras"] = normalize_cameras(cams, a["id"])
+        return doc
+
+    def api(name, path, ttl):
+        url = API + path + ("&" if "?" in path else "?") + "apiaccesscode=" + urllib.parse.quote(key)
+        return src.get(name, url, ttl)
+
+    # Terminals: live coordinates and names merged over the static table.
+    live_terms, _ = api("terminallocations", "/terminals/rest/terminallocations", TTL["terminallocations"])
+    terminals = merge_terminal_locations(meta["terminals"], live_terms)
+
+    a_tok, b_tok = split_route(args.route)
+    a = resolve_terminal(a_tok, terminals)
+    b = resolve_terminal(b_tok, terminals)
+    if a is None or b is None or a["id"] == b["id"]:
+        doc["error"] = "unknown route: %s" % clean(args.route, 80)
+        mates, _ = api("terminalsandmates", "/schedule/rest/terminalsandmates/" + day_key(now, zone), TTL["terminalsandmates"])
+        doc["routes"] = normalize_routes(mates, terminals)
+        doc["errors"] = src.errors[:8]
+        return doc
+
+    today = day_key(now, zone)
+    routes_raw, _ = api("routes-%d-%d" % (a["id"], b["id"]), "/schedule/rest/routes/%s/%d/%d" % (today, a["id"], b["id"]), TTL["routes"])
+    route_ids, route_abbrevs, route_name = [], [], ""
+    if isinstance(routes_raw, list):
+        for r in routes_raw:
+            if not isinstance(r, dict):
+                continue
+            rid = integer(r.get("RouteID"))
+            if rid is not None:
+                route_ids.append(rid)
+            ab = clean(r.get("RouteAbbrev"), 16)
+            if ab:
+                route_abbrevs.append(ab)
+            if not route_name:
+                route_name = clean(r.get("Description"), MAX_NAME)
+
+    sched_raw, _ = api("schedule-%d-%d-%s" % (a["id"], b["id"], today),
+                       "/schedule/rest/scheduletoday/%d/%d/false" % (a["id"], b["id"]), TTL["schedule"])
+    times, notes, annotations, pdf = schedule_times(sched_raw, a["id"], b["id"])
+    for t in times:
+        for rid in t.get("routes") or []:
+            if rid not in route_ids:
+                route_ids.append(rid)
+
+    vessels_raw, _ = api("vessellocations", "/vessels/rest/vessellocations", TTL["vessellocations"])
+    vessels = normalize_vessels(vessels_raw, a["id"], b["id"], route_abbrevs, zone)
+
+    space_raw, _ = api("sailingspace-%d" % a["id"], "/terminals/rest/terminalsailingspace/%d" % a["id"], TTL["sailingspace"])
+    space = sailing_space(space_raw, b["id"])
+
+    doc["departures"] = build_departures(times, space, vessels, now, a["id"], zone)
+    doc["vessels"] = vessels
+
+    alerts_raw, _ = api("alerts", "/schedule/rest/alerts", TTL["alerts"])
+    doc["alerts"] = normalize_alerts(alerts_raw, route_ids, zone)
+
+    bulletins_raw, _ = api("bulletins-%d" % a["id"], "/terminals/rest/terminalbulletins/%d" % a["id"], TTL["bulletins"])
+    doc["bulletins"] = normalize_bulletins(bulletins_raw, zone)
+
+    waits_raw, _ = api("waittimes-%d" % a["id"], "/terminals/rest/terminalwaittimes/%d" % a["id"], TTL["waittimes"])
+    waits = normalize_waits(waits_raw, zone)
+    if route_ids:
+        matching = [w for w in waits if w.get("routeId") in route_ids]
+        waits = matching or waits
+    doc["waitTimes"] = waits
+
+    cams_raw, _ = src.get("cameras", CAMERA_FEED, TTL["cameras"])
+    doc["cameras"] = normalize_cameras(cams_raw, a["id"])
+
+    mates_raw, _ = api("terminalsandmates", "/schedule/rest/terminalsandmates/" + today, TTL["terminalsandmates"])
+    doc["routes"] = normalize_routes(mates_raw, terminals)
+
+    pages = route_pages(meta, a["id"], b["id"]) or {}
+    links = {
+        "schedule": "https://wsdot.com/ferries/schedule/scheduledetailbyroute.aspx?route=" + pages["schedule"] if pages.get("schedule") else meta["links"]["schedule"],
+        "schedulePdf": pdf,
+        "map": "https://wsdot.com/ferries/vesselwatch/default.aspx?view=" + pages.get("map", "sea"),
+        "alerts": meta["links"]["alerts"],
+        "terminal": "https://wsdot.com/ferries/vesselwatch/TerminalDetail.aspx?terminalid=%d" % a["id"],
+        "cameras": "https://wsdot.com/ferries/vesselwatch/cameradetail.aspx?terminalid=%d" % a["id"],
+    }
+    doc["route"] = {
+        "id": route_ids[0] if route_ids else None,
+        "ids": route_ids[:6],
+        "abbrev": route_abbrevs[0] if route_abbrevs else "",
+        "name": route_name or (a["name"] + " / " + b["name"]),
+        "from": public_terminal(a),
+        "to": public_terminal(b),
+        "notes": notes,
+        "annotations": annotations,
+        "links": links,
+    }
+    doc["errors"] = src.errors[:8]
+    # "ok" means the live sailing list exists. Missing extras (alerts, cameras)
+    # degrade the panel; a missing schedule empties it.
+    doc["ok"] = bool(times) or bool(space)
+    if not doc["ok"]:
+        if any("api key rejected" in e for e in src.errors):
+            doc["error"] = "api key rejected"
+        elif src.errors:
+            doc["error"] = "offline: " + src.errors[0]
+        else:
+            doc["error"] = "no sailings today for this route"
+    return doc
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--route", default="Bainbridge Island - Seattle")
+    parser.add_argument("--key", default="")
+    parser.add_argument("--now", type=int, default=None, help="epoch seconds, for tests")
+    parser.add_argument("--cache-dir", default=None)
+    parser.add_argument("--fixtures", default=None, help="directory of recorded API responses instead of the network")
+    parser.add_argument("--no-network", action="store_true", help="serve only from cache")
+    parser.add_argument("--pretty", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        doc = build(args)
+    except Exception as exc:  # never let a traceback be the document
+        doc = {"schema": SCHEMA, "provider": "wsdot", "ok": False, "error": "provider crashed: " + exc.__class__.__name__,
+               "generatedAt": args.now or int(time.time()), "departures": [], "vessels": [], "alerts": [],
+               "bulletins": [], "waitTimes": [], "cameras": [], "routes": [], "errors": [clean(str(exc), 200)]}
+    if args.pretty:
+        json.dump(doc, sys.stdout, indent=2, ensure_ascii=False)
+    else:
+        json.dump(doc, sys.stdout, separators=(",", ":"), ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0 if doc.get("ok") or doc.get("error") in ("no api key",) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

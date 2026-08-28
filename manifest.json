@@ -1,0 +1,113 @@
+{
+  "schemaVersion": 1,
+  "id": "jampick.ferries",
+  "name": "Ferries",
+  "version": "1.0.0",
+  "author": "jampick",
+  "license": "MIT",
+  "description": "Next ferry, the one after it, whether it is late, how many car spaces are left, where the boats are, terminal cameras and route alerts in the Omarchy bar. Washington State Ferries first, other systems drop in as providers.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Ferries",
+    "description": "Countdown to the next sailing in the bar. The panel has the next departures with drive-up space and lateness, a live map of the boats on the route, terminal cameras, wait times, bulletins and route alerts, plus the full day's schedule.",
+    "category": "Info",
+    "aliases": ["ferries", "ferry", "wsf"],
+    "allowMultiple": true,
+    "defaultSection": "right",
+    "defaults": {
+      "provider": "wsdot",
+      "route": "Bainbridge Island - Seattle",
+      "apiKey": "",
+      "barLabel": "countdown",
+      "departuresShown": 4,
+      "refreshIntervalSec": 60,
+      "panelRefreshIntervalSec": 20,
+      "showCamera": true,
+      "cameraIntervalSec": 60
+    },
+    "schema": [
+      {
+        "key": "provider",
+        "type": "enum",
+        "label": "Ferry system",
+        "options": ["wsdot"],
+        "defaultValue": "wsdot",
+        "description": "Which provider under providers/ supplies the data. wsdot is Washington State Ferries."
+      },
+      {
+        "key": "route",
+        "type": "string",
+        "label": "Route",
+        "defaultValue": "Bainbridge Island - Seattle",
+        "description": "Departing terminal, then arriving terminal, separated by a dash. Names, abbreviations (BBI, P52) or terminal ids all work. The panel's route picker sets this for you."
+      },
+      {
+        "key": "apiKey",
+        "type": "string",
+        "label": "WSDOT API access code",
+        "defaultValue": "",
+        "description": "Free, from https://wsdot.wa.gov/traffic/api/ (they email it). Leave blank to read it from $WSDOT_ACCESS_CODE or ~/.config/omarchy-ferries/wsdot-access-code instead."
+      },
+      {
+        "key": "barLabel",
+        "type": "enum",
+        "label": "Bar label",
+        "options": ["countdown", "time", "icon"],
+        "defaultValue": "countdown",
+        "description": "What sits next to the icon: minutes until the next sailing, its clock time, or nothing."
+      },
+      {
+        "key": "departuresShown",
+        "type": "integer",
+        "label": "Departures shown",
+        "min": 1,
+        "max": 12,
+        "step": 1,
+        "defaultValue": 4,
+        "description": "How many upcoming sailings the panel lists. Press f in the panel for the whole day."
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 20,
+        "max": 600,
+        "step": 10,
+        "defaultValue": 60,
+        "description": "How often the bar re-fetches vessel positions and sailing space while the panel is closed."
+      },
+      {
+        "key": "panelRefreshIntervalSec",
+        "type": "integer",
+        "label": "Panel refresh interval (seconds)",
+        "min": 10,
+        "max": 300,
+        "step": 5,
+        "defaultValue": 20,
+        "description": "Refresh rate while the panel is open. Vessel positions move, so this is faster."
+      },
+      {
+        "key": "showCamera",
+        "type": "boolean",
+        "label": "Terminal camera",
+        "defaultValue": true,
+        "description": "Load the departing terminal's camera stills while the panel is open. Nothing is downloaded while it is closed."
+      },
+      {
+        "key": "cameraIntervalSec",
+        "type": "integer",
+        "label": "Camera refresh (seconds)",
+        "min": 15,
+        "max": 600,
+        "step": 15,
+        "defaultValue": 60,
+        "description": "How often the camera still is re-downloaded while visible."
+      }
+    ]
+  }
+}

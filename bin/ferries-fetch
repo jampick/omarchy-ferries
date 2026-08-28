@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Provider dispatcher. The QML side never knows which ferry system it is
+# talking to: it asks this script for a normalized document and renders that.
+#
+#   ferries-fetch --provider wsdot --route "Bainbridge Island - Seattle" [--key CODE]
+#
+# A provider is a directory under providers/<id>/ with an executable `fetch`
+# that accepts the same flags and prints one JSON document in the shape
+# described in providers/README.md. Adding a region means adding a directory;
+# nothing above this line changes.
+
+set -uo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+provider=wsdot
+args=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --provider) provider=${2:-}; shift 2 ;;
+    --provider=*) provider=${1#--provider=}; shift ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+
+# Provider ids are directory names chosen by whoever wrote the manifest, but
+# the value arrives through user settings, so keep it to a plain identifier
+# rather than letting it pick an arbitrary path.
+case "$provider" in
+  ''|*[!a-zA-Z0-9_-]*)
+    printf '{"schema":1,"ok":false,"error":"invalid provider id"}\n'
+    exit 3 ;;
+esac
+
+script="$here/providers/$provider/fetch"
+if [ ! -x "$script" ]; then
+  printf '{"schema":1,"ok":false,"provider":"%s","error":"no such provider: %s"}\n' "$provider" "$provider"
+  exit 3
+fi
+
+exec "$script" "${args[@]}"

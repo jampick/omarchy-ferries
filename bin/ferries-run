@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Run a command with a hard cap on how many bytes of its output reach the shell.
+#
+# Quickshell's StdioCollector has no size limit: it accumulates a process's
+# stdout to completion and then hands QML the whole thing. Everything this
+# widget reads comes from a ferry operator's servers, which puts a remote party
+# on the far end of every byte. The bar's shell process is long-lived and owns
+# every widget in the bar, so an unbounded response is a denial of service and
+# not merely a large string.
+#
+# The cap is applied here, in a separate process, so the bytes are dropped
+# before they are ever collected in QML. The provider script caps itself too
+# (item counts, string lengths, response sizes); this is the backstop that does
+# not depend on the provider being well behaved.
+#
+# 256 KiB is roughly 10x a full day's normalized document for a busy route.
+#
+# Truncating stdout kills the writer with SIGPIPE, so an over-limit call comes
+# back non-zero and the caller discards it rather than parsing half a record.
+# Other exit codes pass through untouched.
+
+set -uo pipefail
+
+limit=${FERRIES_MAX_BYTES:-262144}
+
+if [ $# -eq 0 ]; then
+  echo "usage: ferries-run COMMAND [ARG...]" >&2
+  exit 2
+fi
+
+# stderr gets its own cap on its own pipe, so a flood on one stream can neither
+# hide nor consume the budget of the other.
+exec 3> >(head -c "$limit" >&2)
+
+"$@" 2>&3 | head -c "$limit"
+rc=${PIPESTATUS[0]}
+
+exec 3>&-
+wait 2>/dev/null
+
+exit "$rc"
