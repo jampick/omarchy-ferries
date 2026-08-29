@@ -7,6 +7,7 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 run="$here/bin/ferries-run"
 fetch="$here/bin/ferries-fetch"
 camera="$here/bin/ferries-camera"
+keyfile="$here/bin/ferries-keyfile"
 fail=0
 
 eq() { # label got want
@@ -41,10 +42,42 @@ tmp=$(mktemp -d)
 keyless=$(HOME="$tmp" XDG_CONFIG_HOME="$tmp" WSDOT_ACCESS_CODE= bash "$fetch" --provider wsdot --route 'BBI - P52' --no-network --cache-dir "$tmp" | head -c 60)
 eq 'dispatches to wsdot' "${keyless:0:32}" '{"schema":1,"provider":"wsdot","'
 
-# Camera downloader: only the operators' image hosts, only https.
-bash "$camera" 'https://evil.example/x.jpg' "$tmp/x.jpg" 2>/dev/null; eq 'camera refuses unknown host' "$?" 3
-bash "$camera" 'http://images.wsdot.wa.gov/x.jpg' "$tmp/x.jpg" 2>/dev/null; eq 'camera refuses plain http' "$?" 3
-bash "$camera" 2>/dev/null; eq 'camera without args is a usage error' "$?" 2
+# Camera downloader: only the operators' image hosts, only https, and never
+# a destination it did not create itself.
+"$camera" 'https://evil.example/x.jpg' "$tmp/x.jpg" 2>/dev/null; eq 'camera refuses unknown host' "$?" 3
+"$camera" 'https://images.wsdot.wa.gov.evil.example/x.jpg' "$tmp/x.jpg" 2>/dev/null; eq 'camera refuses a lookalike host' "$?" 3
+"$camera" 'http://images.wsdot.wa.gov/x.jpg' "$tmp/x.jpg" 2>/dev/null; eq 'camera refuses plain http' "$?" 3
+"$camera" 2>/dev/null; eq 'camera without args is a usage error' "$?" 2
+ln -s /etc/hostname "$tmp/link.jpg"
+"$camera" 'https://images.wsdot.wa.gov/wsf/Bainbridge/Bainbridge.jpg' "$tmp/link.jpg" 2>/dev/null
+eq 'camera refuses to replace a symlink' "$([ -L "$tmp/link.jpg" ] && echo still-a-link)" still-a-link
+mkdir -p "$tmp/shared" && chmod 777 "$tmp/shared"
+symdir=$(mktemp -d) && ln -s "$symdir" "$tmp/linkdir"
+"$camera" 'https://images.wsdot.wa.gov/wsf/Bainbridge/Bainbridge.jpg' "$tmp/linkdir/cam.jpg" 2>/dev/null; eq 'camera refuses a symlinked directory' "$?" 1
+rm -rf "$symdir"
+
+# Key file writer: the code arrives on stdin, never argv, and lands 0600.
+keyhome=$(mktemp -d)
+saved=$(printf 'abc-123\n' | XDG_CONFIG_HOME="$keyhome" "$keyfile")
+eq 'keyfile writes the key file' "$saved" "$keyhome/omarchy-ferries/wsdot-access-code"
+eq 'keyfile content' "$(cat "$keyhome/omarchy-ferries/wsdot-access-code")" abc-123
+eq 'keyfile mode' "$(stat -c %a "$keyhome/omarchy-ferries/wsdot-access-code")" 600
+eq 'keyfile dir mode' "$(stat -c %a "$keyhome/omarchy-ferries")" 700
+printf 'has space\n' | XDG_CONFIG_HOME="$keyhome" "$keyfile" >/dev/null 2>&1; eq 'keyfile rejects whitespace' "$?" 2
+printf '' | XDG_CONFIG_HOME="$keyhome" "$keyfile" >/dev/null 2>&1; eq 'keyfile rejects empty input' "$?" 2
+rm -f "$keyhome/omarchy-ferries/wsdot-access-code"; ln -s /etc/hostname "$keyhome/omarchy-ferries/wsdot-access-code"
+printf 'abc\n' | XDG_CONFIG_HOME="$keyhome" "$keyfile" >/dev/null 2>&1; eq 'keyfile refuses to replace a symlink' "$?" 1
+rm -rf "$keyhome"
+
+# The provider reads the code from stdin when told to, and never from argv.
+stdinkey=$(printf 'from-stdin\n' | HOME="$tmp" XDG_CONFIG_HOME="$tmp" WSDOT_ACCESS_CODE= python3 -c '
+import importlib.machinery, importlib.util, sys
+sys.dont_write_bytecode = True
+p = sys.argv[1]
+spec = importlib.util.spec_from_file_location("f", p, loader=importlib.machinery.SourceFileLoader("f", p))
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print(m.find_key("", True))' "$here/providers/wsdot/fetch")
+eq 'provider takes the key from stdin' "$stdinkey" from-stdin
 rm -rf "$tmp"
 
 echo

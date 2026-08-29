@@ -96,12 +96,13 @@ items stay out of a Bainbridge view even though they share Colman Dock.
 - A free **WSDOT Traveler API access code**. Register an email at
   https://wsdot.wa.gov/traffic/api/ and it is emailed to you. Then either:
   - paste it into the panel: the first-run notice has a field and a Save
-    button, which run `omarchy bar set jampick.ferries apiKey YOUR-CODE` for
-    you (it lands in `~/.config/omarchy/shell.json`), or
-  - run that command yourself, or
-  - save it to `~/.config/omarchy-ferries/wsdot-access-code` (mode 600 is a
-    good idea), or
-  - export `WSDOT_ACCESS_CODE`.
+    button, which write `~/.config/omarchy-ferries/wsdot-access-code` (0600,
+    directory 0700) for you, or
+  - create that file yourself, or
+  - export `WSDOT_ACCESS_CODE`, or
+  - `omarchy bar set jampick.ferries apiKey YOUR-CODE` (lands in
+    `~/.config/omarchy/shell.json`; the widget hands it to the provider over
+    stdin, never on a command line).
   The panel tells you when it has no code, and links to the registration page.
   Terminal cameras work without one.
 - `python3`, `bash`, `curl`, `jq`: all on a base Omarchy install. The WSDOT
@@ -140,10 +141,10 @@ or `omarchy plugin disable jampick.ferries && rm -rf
 ~/.config/omarchy/plugins/jampick.ferries`. The widget writes nothing outside
 its own directory except: cached API responses in
 `~/.cache/omarchy-ferries/`, camera stills in
-`$XDG_RUNTIME_DIR/omarchy-ferries/` (gone at logout), and the `route` and
-`apiKey` settings in `~/.config/omarchy/shell.json` when you set them.
-Remove the cache directory and the key file if you made one, and that is
-everything.
+`$XDG_RUNTIME_DIR/omarchy-ferries/` (gone at logout), the key file at
+`~/.config/omarchy-ferries/wsdot-access-code` if you saved one, and the
+`route` (and optionally `apiKey`) settings in `~/.config/omarchy/shell.json`.
+Remove the cache directory and the key file, and that is everything.
 
 ## Settings
 
@@ -197,6 +198,15 @@ from a remote party, so nothing unbounded reaches the shell:
   decodes them.
 - Every poll has a watchdog, so a hung process cannot stop refreshes forever.
 
+The access code never appears on a command line. A configured key reaches
+the provider as one line on stdin; the panel's Save button feeds
+`bin/ferries-keyfile` the same way. Cache files, the key file and camera
+stills are read through descriptors opened with `O_NOFOLLOW`, must be
+regular files owned by you and under a size cap before they are parsed, and
+are written by exclusive-creating a random 0600 temporary file in a 0700
+directory you own and renaming it into place. A symlink or a foreign file
+where one of those is expected is refused, not followed.
+
 ## Tests
 
 ```bash
@@ -228,6 +238,7 @@ Model.js                document intake and view logic (Node-testable)
 bin/ferries-fetch       provider dispatcher
 bin/ferries-run         output cap between providers and the shell
 bin/ferries-camera      bounded camera still downloader
+bin/ferries-keyfile     saves the access code from the panel (stdin in, 0600 file out)
 providers/wsdot/        Washington State Ferries provider
 test/                   Node, Python and bash tests
 LICENSE                 MIT, matching Omarchy

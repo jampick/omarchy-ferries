@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Save the access code typed into the panel to the user's key file.
+
+    printf '%s\\n' CODE | ferries-keyfile
+
+The code arrives on stdin, never on argv, so it is not visible to other
+local processes for even a moment. It lands in
+$XDG_CONFIG_HOME/omarchy-ferries/wsdot-access-code (0600, directory 0700),
+written to an exclusively created temporary file and renamed into place.
+Prints the path on success. Standard library only."""
+
+import os
+import secrets
+import stat
+import sys
+
+MAX_BYTES = 1024
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+
+
+def main():
+    try:
+        code = sys.stdin.readline(MAX_BYTES).strip()
+    except (OSError, ValueError):
+        code = ""
+    if not code or any(ch.isspace() for ch in code) or len(code) > 200:
+        sys.stderr.write("expected one access code on stdin\n")
+        return 2
+    home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    directory = os.path.join(home, "omarchy-ferries")
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        st = os.lstat(directory)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            raise OSError("not our directory")
+    except OSError:
+        sys.stderr.write("cannot use %s\n" % directory)
+        return 1
+    final = os.path.join(directory, "wsdot-access-code")
+    try:
+        st = os.lstat(final)
+        if not stat.S_ISREG(st.st_mode):
+            sys.stderr.write("refusing to replace a non-regular file\n")
+            return 1
+    except FileNotFoundError:
+        pass
+    tmp = os.path.join(directory, ".wsdot-access-code.%s.tmp" % secrets.token_hex(8))
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(code + "\n")
+        os.replace(tmp, final)
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        sys.stderr.write("write failed: %s\n" % exc.__class__.__name__)
+        return 1
+    sys.stdout.write(final + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

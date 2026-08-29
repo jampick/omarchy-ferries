@@ -388,6 +388,42 @@ class EdgeCases(unittest.TestCase):
                 os.environ["XDG_CONFIG_HOME"] = old
             os.environ.pop("WSDOT_ACCESS_CODE", None)
 
+    def test_key_file_must_be_a_plain_owned_file(self):
+        tmp = tempfile.mkdtemp(prefix="ferries-keysym-")
+        os.makedirs(os.path.join(tmp, "omarchy-ferries"))
+        os.symlink("/etc/hostname", os.path.join(tmp, "omarchy-ferries", "wsdot-access-code"))
+        old = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = tmp
+        os.environ["WSDOT_ACCESS_CODE"] = ""
+        try:
+            self.assertEqual(wsdot.find_key(""), "")
+        finally:
+            if old is None:
+                del os.environ["XDG_CONFIG_HOME"]
+            else:
+                os.environ["XDG_CONFIG_HOME"] = old
+            os.environ.pop("WSDOT_ACCESS_CODE", None)
+
+    def test_cache_reads_reject_symlinks_and_oversize(self):
+        tmp = tempfile.mkdtemp(prefix="ferries-cache-")
+        src = wsdot.Source(tmp, now=NOW)
+        self.assertTrue(wsdot.write_file_atomic(tmp, "alerts.json", json.dumps({"fetchedAt": NOW, "body": []}).encode()))
+        self.assertEqual(oct(os.stat(os.path.join(tmp, "alerts.json")).st_mode & 0o777), "0o600")
+        self.assertEqual(src._read_cache("alerts")["body"], [])
+        os.unlink(os.path.join(tmp, "alerts.json"))
+        os.symlink("/etc/hostname", os.path.join(tmp, "alerts.json"))
+        self.assertIsNone(src._read_cache("alerts"))
+        self.assertFalse(wsdot.write_file_atomic(tmp, "alerts.json", b"{}"), "must not replace a symlink")
+        os.unlink(os.path.join(tmp, "alerts.json"))
+        with open(os.path.join(tmp, "big.json"), "wb") as fh:
+            fh.write(b"[" + b"1," * (wsdot.MAX_CACHE_FILE_BYTES // 2) + b"1]")
+        self.assertIsNone(src._read_cache("big"))
+        self.assertIsNone(wsdot.read_file_capped(os.path.join(tmp, "nope.json"), 10))
+        # A cache directory that is a symlink is not used at all.
+        linked = tempfile.mkdtemp(prefix="ferries-cache-target-")
+        os.symlink(linked, os.path.join(tmp, "link"))
+        self.assertFalse(wsdot.write_file_atomic(os.path.join(tmp, "link"), "x.json", b"{}"))
+
     def test_unknown_route_offers_picker(self):
         tmp = tempfile.mkdtemp(prefix="ferries-badroute-")
         write_fixtures(tmp)
@@ -408,7 +444,9 @@ class EdgeCases(unittest.TestCase):
     def test_caps_hold_against_a_flood(self):
         tmp = tempfile.mkdtemp(prefix="ferries-flood-")
         many = [(NOW + i * 60, 38, "Wenatchee" * 40, []) for i in range(500)]
-        alerts = [{"BulletinID": i, "AlertFullTitle": "A" * 5000, "BulletinText": "B" * 5000, "PublishDate": wcf(NOW - i),
+        # Just under the 2 MiB response cap: the cap rejecting an oversized
+        # body outright is covered separately; this checks the per-list caps.
+        alerts = [{"BulletinID": i, "AlertFullTitle": "A" * 3000, "BulletinText": "B" * 3000, "PublishDate": wcf(NOW - i),
                    "AllRoutesFlag": True, "AffectedRouteIDs": []} for i in range(300)]
         write_fixtures(tmp, **{"schedule-3-7-2026-08-28": schedule(many), "alerts": alerts})
         rc, doc, _ = run(tmp)
@@ -417,6 +455,17 @@ class EdgeCases(unittest.TestCase):
         self.assertLessEqual(len(doc["alerts"][0]["title"]), wsdot.MAX_TITLE)
         self.assertLessEqual(len(doc["departures"][0]["vessel"]), wsdot.MAX_NAME)
         self.assertLess(len(json.dumps(doc)), 262144)
+
+    def test_oversized_response_is_rejected_whole(self):
+        tmp = tempfile.mkdtemp(prefix="ferries-oversize-")
+        alerts = [{"BulletinID": i, "AlertFullTitle": "A" * 8000, "BulletinText": "B" * 8000, "PublishDate": wcf(NOW - i),
+                   "AllRoutesFlag": True, "AffectedRouteIDs": []} for i in range(200)]
+        write_fixtures(tmp, alerts=alerts)
+        self.assertGreater(os.path.getsize(os.path.join(tmp, "alerts.json")), wsdot.MAX_CACHE_FILE_BYTES)
+        rc, doc, _ = run(tmp)
+        self.assertTrue(doc["ok"])
+        self.assertEqual(doc["alerts"], [])
+        self.assertTrue(any(e.startswith("alerts:") for e in doc["errors"]))
 
     def test_garbage_upstream_does_not_crash(self):
         tmp = tempfile.mkdtemp(prefix="ferries-garbage-")

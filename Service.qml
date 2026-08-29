@@ -93,12 +93,18 @@ Item {
 
   // --- Refresh ---------------------------------------------------------------
 
+  // The access code never goes on argv, where every local process could
+  // read it from /proc. A configured key is handed to the provider as one
+  // line on stdin once the process has started (see fetchProc.onStarted).
+  property string pendingKey: ""
+
   function refresh() {
     if (fetchProc.running) { refreshPending = true; return }
     refreshPending = false
     runningGeneration = generation
     var argv = ["bash", fetchPath, "--provider", provider, "--route", route]
-    if (apiKey !== "") argv.push("--key", apiKey)
+    pendingKey = apiKey
+    if (pendingKey !== "") argv.push("--key-stdin")
     fetchProc.command = capped(argv)
     fetchProc.running = true
     fetchWatchdog.restart()
@@ -110,11 +116,18 @@ Item {
   onProviderChanged: { generation++; doc = null; loading = true; Qt.callLater(refresh) }
   onApiKeyChanged: { generation++; Qt.callLater(refresh) }
 
-  // Written through the same command a user would type, like the route.
+  // The code typed into the panel goes to the user's key file, over the
+  // helper's stdin. Not through `omarchy bar set`: that would put the secret
+  // on a command line, and in shell.json, neither of which it needs.
+  property string pendingKeyFile: ""
+  readonly property string keyfilePath: String(Qt.resolvedUrl("bin/ferries-keyfile")).replace(/^file:\/\//, "")
+
   function persistApiKey(value) {
     var text = String(value || "").trim()
-    if (text.length > 200 || /[\s"'`$\\]/.test(text)) return false
-    Quickshell.execDetached(["omarchy", "bar", "set", "jampick.ferries", "apiKey", text])
+    if (text === "" || text.length > 200 || /\s/.test(text) || keyfileProc.running) return false
+    pendingKeyFile = text
+    keyfileProc.command = capped([keyfilePath])
+    keyfileProc.running = true
     return true
   }
 
@@ -146,7 +159,7 @@ Item {
     if (!cam || typeof cam.url !== "string" || cam.url.indexOf("https://") !== 0) return
     var dest = runtimeDir + "/cam-" + String(parseInt(cam.id, 10) || 0) + ".jpg"
     cameraTitle = cam.title || ""
-    cameraProc.command = capped(["bash", cameraPath, cam.url, dest])
+    cameraProc.command = capped([cameraPath, cam.url, dest])
     cameraProc.running = true
     cameraWatchdog.restart()
   }
@@ -255,8 +268,13 @@ Item {
     id: fetchProc
     running: false
     command: []
+    stdinEnabled: true
     stdout: StdioCollector { id: fetchOut; waitForEnd: true }
     stderr: StdioCollector { id: fetchErr; waitForEnd: true }
+    onStarted: {
+      if (root.pendingKey !== "") write(root.pendingKey + "\n")
+      root.pendingKey = ""
+    }
     onExited: function(exitCode) {
       fetchWatchdog.stop()
       var stale = root.runningGeneration !== root.generation
@@ -277,6 +295,24 @@ Item {
       root.applyDocument(out)
     }
   }
+
+  Process {
+    id: keyfileProc
+    running: false
+    command: []
+    stdinEnabled: true
+    stdout: StdioCollector { id: keyfileOut; waitForEnd: true }
+    onStarted: {
+      if (root.pendingKeyFile !== "") write(root.pendingKeyFile + "\n")
+      root.pendingKeyFile = ""
+    }
+    onExited: function(exitCode) {
+      root.keySaved(exitCode === 0)
+      if (exitCode === 0) { root.generation++; Qt.callLater(root.refresh) }
+    }
+  }
+
+  signal keySaved(bool ok)
 
   Process {
     id: cameraProc

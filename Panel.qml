@@ -73,11 +73,19 @@ Panel {
   function saveKey() {
     var text = keyField.text.trim()
     if (text === "") { keyMessage = "Nothing to save yet."; keyMessageUrgent = true; return }
-    if (!ferries.persistApiKey(text)) { keyMessage = "That does not look like an access code (no spaces or quotes)."; keyMessageUrgent = true; return }
+    if (!ferries.persistApiKey(text)) { keyMessage = "That does not look like an access code (no spaces)."; keyMessageUrgent = true; return }
     keyField.text = ""
-    keyMessage = "Saved. Fetching today's sailings…"
+    keyMessage = "Saving…"
     keyMessageUrgent = false
     keyCatcher.forceActiveFocus()
+  }
+
+  Connections {
+    target: ferries
+    function onKeySaved(ok) {
+      root.keyMessage = ok ? "Saved to ~/.config/omarchy-ferries/wsdot-access-code. Fetching today's sailings…" : "Could not write the key file."
+      root.keyMessageUrgent = !ok
+    }
   }
 
   readonly property var departureRows: Model.departureRows(doc, now, ferries.departuresShown, fullDay)
@@ -472,7 +480,7 @@ Panel {
                 Button {
                   id: saveKeyButton
                   text: "Save"
-                  tooltipText: "Runs omarchy bar set jampick.ferries apiKey …"
+                  tooltipText: "Saves to ~/.config/omarchy-ferries/wsdot-access-code (0600)"
                   foreground: root.foreground
                   fontFamily: root.fontFamily
                   fontSize: Style.font.bodySmall
