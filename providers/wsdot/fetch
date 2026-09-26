@@ -639,8 +639,18 @@ def classify(dep, boat, now, live_taken):
 
     if past:
         # Still here past its time, and this is the sailing it is here for.
-        if at_our_dock and not live_taken and (sched is None or sched <= when + LATE_GRACE_SEC):
-            return "late", int(round((now - when) / 60.0)), "still at dock"
+        if at_our_dock and not live_taken:
+            # VesselWatch names the boat's next departure: trust it, however
+            # long the boat has been sitting there.
+            if sched is not None and sched <= when + LATE_GRACE_SEC:
+                return "late", int(round((now - when) / 60.0)), "still at dock"
+            # No scheduled departure on the feed. That is what a boat tied up
+            # for the night looks like, and it would otherwise claim its
+            # earliest sailing of the day as "late" by 18 hours. Only a
+            # sailing still inside the past window can be the one it is
+            # here for.
+            if sched is None and now <= when + PAST_WINDOW_SEC:
+                return "late", int(round((now - when) / 60.0)), "still at dock"
         return "departed", None, ""
 
     if live_taken:

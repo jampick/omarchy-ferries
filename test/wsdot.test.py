@@ -329,6 +329,49 @@ class Document(unittest.TestCase):
         self.assertEqual(late["text"], "Mechanical & crew")
         self.assertEqual(late["type"], "Delay")
 
+    def test_boat_tied_up_for_the_night_is_not_late(self):
+        # Late evening: Tacoma is done for the day and sits at Bainbridge with
+        # no ScheduledDeparture on VesselWatch. Its earliest sailing of the
+        # day must read "departed", not "late by 18 hours", or the bar shows
+        # "+1108m" instead of the countdown to the last boat.
+        night = NOW + 9 * 3600 + 48 * 60  # 23:48
+        tmp = tempfile.mkdtemp(prefix="ferries-night-")
+        write_fixtures(tmp, **{
+            "schedule-3-7-2026-08-28": schedule([
+                (NOW - 55 * 60, 68, "Tacoma", []),          # 13:05
+                (NOW + 6 * 3600, 68, "Tacoma", []),         # 20:00
+                (night - 18 * 60, 38, "Wenatchee", []),     # 23:30, under way
+                (night + 67 * 60, 38, "Wenatchee", []),     # 00:55, the last boat
+            ]),
+            "sailingspace-3": [],
+            "vessellocations": [
+                vessel(68, "Tacoma", AtDock=True, Speed=0, ArrivingTerminalID=None, ArrivingTerminalName=None, ArrivingTerminalAbbrev=None),
+                vessel(38, "Wenatchee", LeftDock=wcf(night - 15 * 60), ScheduledDeparture=wcf(night - 18 * 60), Eta=wcf(night + 17 * 60)),
+            ],
+        })
+        cmd = [sys.executable, FETCH, "--route", "Bainbridge Island - Seattle", "--now", str(night), "--fixtures", tmp]
+        proc = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, "WSDOT_ACCESS_CODE": "", "HOME": tmp})
+        doc = json.loads(proc.stdout)
+        by = {d["timeLabel"]: d for d in doc["departures"]}
+        self.assertEqual(by["1:05 PM"]["status"], "departed")
+        self.assertIsNone(by["1:05 PM"]["delayMin"])
+        self.assertEqual(by["8:00 PM"]["status"], "departed")
+        self.assertEqual(by["11:30 PM"]["status"], "departed")
+        self.assertEqual(by["12:55 AM"]["status"], "scheduled")
+        # The same boat with no ScheduledDeparture but a sailing only ten
+        # minutes old is still the boat that has not left yet.
+        late = self.deps()["1:50 PM"]
+        self.assertEqual(late["status"], "late")
+
+    def test_at_dock_without_scheduled_departure_is_late_inside_window(self):
+        tmp = tempfile.mkdtemp(prefix="ferries-nosched-")
+        write_fixtures(tmp, vessellocations=[vessel(68, "Tacoma", AtDock=True, Speed=0)])
+        rc, doc, _ = run(tmp)
+        by = {d["timeLabel"]: d for d in doc["departures"]}
+        self.assertEqual(by["1:50 PM"]["status"], "late")
+        self.assertEqual(by["1:50 PM"]["delayMin"], 10)
+        self.assertEqual(by["3:20 PM"]["status"], "cancelled")
+
     def test_bulletins_sorted_and_cleaned(self):
         self.assertEqual([b["title"] for b in self.doc["bulletins"]], ["Walk-on", "Parking"])
         self.assertEqual(self.doc["bulletins"][1]["text"], "Lot A closed")
